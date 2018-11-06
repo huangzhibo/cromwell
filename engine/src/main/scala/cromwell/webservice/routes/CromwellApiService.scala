@@ -8,7 +8,7 @@ import akka.http.scaladsl.marshalling.{ToEntityMarshaller, ToResponseMarshallabl
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers.RawHeader
 import akka.http.scaladsl.server.Directives._
-import akka.http.scaladsl.server.Route
+import akka.http.scaladsl.server.{ExceptionHandler, Route}
 import akka.pattern.{AskTimeoutException, ask}
 import akka.stream.ActorMaterializer
 import akka.util.{ByteString, Timeout}
@@ -111,31 +111,7 @@ trait CromwellApiService extends HttpInstrumentation
     path("workflows" / Segment / Segment / "abort") { (_, possibleWorkflowId) =>
       post {
         instrumentRequest {
-          def sendAbort(workflowId: WorkflowId): Route = {
-            val response = workflowStoreActor.ask(WorkflowStoreActor.AbortWorkflowCommand(workflowId)).mapTo[AbortResponse]
-
-            onComplete(response) {
-              case Success(WorkflowAbortingResponse(id, restarted)) =>
-                workflowManagerActor ! AbortWorkflowCommand(id, restarted)
-                complete(ToResponseMarshallable(WorkflowAbortResponse(id.toString, WorkflowAborting.toString)))
-              case Success(WorkflowAbortFailureResponse(_, e: IllegalStateException)) =>
-                /*
-                  Note that this is currently impossible to reach but was left as-is during the transition to akka http.
-                  When aborts get fixed, this should be looked at.
-                */
-                e.errorRequest(StatusCodes.Forbidden)
-              case Success(WorkflowAbortFailureResponse(_, e: WorkflowNotFoundException)) => e.errorRequest(StatusCodes.NotFound)
-              case Success(WorkflowAbortFailureResponse(_, e)) => e.errorRequest(StatusCodes.InternalServerError)
-              case Failure(_: AskTimeoutException) if CromwellShutdown.shutdownInProgress() => serviceShuttingDownResponse
-              case Failure(e: TimeoutException) => e.failRequest(StatusCodes.ServiceUnavailable)
-              case Failure(e) => e.errorRequest(StatusCodes.InternalServerError)
-            }
-          }
-
-          Try(WorkflowId.fromString(possibleWorkflowId)) match {
-            case Success(workflowId) => sendAbort(workflowId)
-            case Failure(_) => InvalidWorkflowException(possibleWorkflowId).failRequest(StatusCodes.BadRequest)
-          }
+          abortWorkflow(possibleWorkflowId, workflowStoreActor, workflowManagerActor)
         }
       }
     } ~
@@ -242,6 +218,43 @@ object CromwellApiService {
     def errorRequest(statusCode: StatusCode, warnings: Seq[String] = Vector.empty): Route = {
       completeResponse(statusCode, APIResponse.error(e).toJson.prettyPrint, warnings)
     }
+  }
+
+  def abortWorkflow(possibleWorkflowId: String,
+                    workflowStoreActor: ActorRef,
+                    workflowManagerActor: ActorRef,
+                    errorHandler: PartialFunction[Throwable, Route] = standardAbortErrorHandler)(implicit timeout: Timeout): Route = {
+    def sendAbort(workflowId: WorkflowId): Route = {
+      val response = workflowStoreActor.ask(WorkflowStoreActor.AbortWorkflowCommand(workflowId)).mapTo[AbortResponse]
+
+      onComplete(response) {
+        case Success(WorkflowAbortingResponse(id, restarted)) =>
+          workflowManagerActor ! AbortWorkflowCommand(id, restarted)
+          complete(ToResponseMarshallable(WorkflowAbortResponse(id.toString, WorkflowAborting.toString)))
+        /*
+          Note that this is currently impossible to reach but was left as-is during the transition to akka http.
+          When aborts get fixed, this should be looked at.
+        */
+        case Success(WorkflowAbortFailureResponse(_, e: IllegalStateException)) => throw e
+        case Success(WorkflowAbortFailureResponse(_, e)) => throw e
+        case Failure(e) => throw e
+      }
+    }
+
+    handleExceptions(ExceptionHandler(errorHandler)) {
+      Try(WorkflowId.fromString(possibleWorkflowId)) match {
+        case Success(workflowId) => sendAbort(workflowId)
+        case Failure(_) => InvalidWorkflowException(possibleWorkflowId).failRequest(StatusCodes.BadRequest)
+      }
+    }
+  }
+
+  private def standardAbortErrorHandler: PartialFunction[Throwable, Route] = {
+    case e: IllegalStateException => e.errorRequest(StatusCodes.Forbidden)
+    case e: WorkflowNotFoundException => e.errorRequest(StatusCodes.NotFound)
+    case _: AskTimeoutException if CromwellShutdown.shutdownInProgress() => serviceShuttingDownResponse
+    case e: TimeoutException => e.failRequest(StatusCodes.ServiceUnavailable)
+    case e: Exception => e.errorRequest(StatusCodes.InternalServerError)
   }
 
   def validateWorkflowId(possibleWorkflowId: String,
