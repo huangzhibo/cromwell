@@ -3,10 +3,10 @@ package cromwell.webservice.routes.wes
 import akka.actor.ActorRef
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.server.Route
-import akka.pattern.ask
+import akka.pattern.{AskTimeoutException, ask}
 import akka.util.Timeout
 import cromwell.engine.instrumentation.HttpInstrumentation
-import cromwell.services.metadata.MetadataService.{GetStatus, MetadataServiceResponse, StatusLookupResponse}
+import cromwell.services.metadata.MetadataService.{GetStatus, MetadataServiceResponse, StatusLookupFailed, StatusLookupResponse}
 import cromwell.webservice.routes.CromwellApiService.{EnhancedThrowable, UnrecognizedWorkflowException, validateWorkflowId}
 
 import scala.concurrent.ExecutionContext
@@ -14,11 +14,15 @@ import scala.util.{Failure, Success}
 import WesResponseJsonSupport._
 import akka.http.scaladsl.model.StatusCodes
 import akka.http.scaladsl.server.directives.RouteDirectives.complete
-import cromwell.webservice.metadata.MetadataBuilderActor.FailedMetadataResponse
 import WesRouteSupport._
+import cromwell.engine.workflow.WorkflowManagerActor.WorkflowNotFoundException
+import cromwell.server.CromwellShutdown
+import cromwell.webservice.routes.CromwellApiService
 
 trait WesRouteSupport extends HttpInstrumentation {
   val serviceRegistryActor: ActorRef
+  val workflowManagerActor: ActorRef
+  val workflowStoreActor: ActorRef
 
   implicit val ec: ExecutionContext
   implicit val timeout: Timeout
@@ -41,17 +45,18 @@ trait WesRouteSupport extends HttpInstrumentation {
                 case Success(s: StatusLookupResponse) =>
                   val wesState = WesState.fromCromwellStatus(s.status)
                   complete(WesRunStatus(s.workflowId.toString, wesState))
-                  // FIXME: waht about MetadataServiceResponses *not* StatusLookupReponse ?
-                  // FIXME the below is almost certainly not right (it's from the metadata builder actor)
-                case Success(r: FailedMetadataResponse) => r.reason.errorRequest(StatusCodes.InternalServerError)
+                case Success(r: StatusLookupFailed) => r.reason.errorRequest(StatusCodes.InternalServerError)
+                case Success(m: MetadataServiceResponse) =>
+                  // This should never happen, but ....
+                  val error = new IllegalStateException("Unexpected response from Metadata service: " + m)
+                  error.errorRequest(StatusCodes.InternalServerError)
                 case Failure(_: UnrecognizedWorkflowException) => complete(NotFoundError)
                 case Failure(e) => complete(WesErrorResponse(e.getMessage, StatusCodes.InternalServerError.intValue))
               }
+            },
+            path(Segment / "cancel") { possibleWorkflowId =>
+              CromwellApiService.abortWorkflow(possibleWorkflowId, workflowStoreActor, workflowManagerActor, errorHandler = WesAbortErrorHandler)
             }
-//            ,
-//            path(Segment / "cancel") { possibleWorkflowId =>
-//
-//            }
           )
         }
       )
@@ -60,4 +65,11 @@ trait WesRouteSupport extends HttpInstrumentation {
 
 object WesRouteSupport {
   val NotFoundError = WesErrorResponse("The requested workflow run wasn't found", StatusCodes.NotFound.intValue)
+
+  def WesAbortErrorHandler: PartialFunction[Throwable, Route] = {
+    case e: IllegalStateException => e.errorRequest(StatusCodes.Forbidden)
+    case e: WorkflowNotFoundException => e.errorRequest(StatusCodes.NotFound)
+    case _: AskTimeoutException if CromwellShutdown.shutdownInProgress() => new Exception("Cromwell service is shutting down.").failRequest(StatusCodes.InternalServerError)
+    case e: Exception => e.errorRequest(StatusCodes.InternalServerError)
+  }
 }
