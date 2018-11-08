@@ -1,9 +1,9 @@
 package cromwell.database.sql
 
-import cromwell.database.sql.tables.WorkflowStoreEntry
-import cromwell.database.sql.tables.WorkflowStoreEntry.WorkflowStoreState.WorkflowStoreState
+import java.sql.Timestamp
 
-import scala.concurrent.duration.FiniteDuration
+import cromwell.database.sql.tables.WorkflowStoreEntry
+
 import scala.concurrent.{ExecutionContext, Future}
 
 trait WorkflowStoreSqlDatabase {
@@ -29,22 +29,19 @@ ____    __    ____  ______   .______       __  ___  _______  __        ______   
   /**
     * Set all running workflows to aborting state.
     */
-  def setAllRunningToAborting()
-                             (implicit ec: ExecutionContext): Future[Unit]
-
-  /**
-    * Set restarted flags for all running and aborting workflows to true.
-    */
-  def markRunningAndAbortingAsRestarted(cromwellId: Option[String])
-                                       (implicit ec: ExecutionContext): Future[Unit]
+  def setStateToState(fromWorkflowState: String, toWorkflowState: String)
+                     (implicit ec: ExecutionContext): Future[Unit]
 
   /**
     * Set the workflow to aborting state.
-    * @return Some(restarted) if the workflow exists in the store, where restarted is the value of its restarted flag
-    *         None if the workflow does not exist in the store
+    *
+    * @return Number of rows deleted, plus Some(restarted) if the workflow exists in the store, where restarted is true
+    *         if the workflow's heartbeat timestamp was cleared on restart, and None if the workflow does not exist.
     */
-  def setToAborting(workflowId: String)
-                   (implicit ec: ExecutionContext): Future[Option[Boolean]]
+  def deleteOrUpdateWorkflowToState(workflowExecutionUuid: String,
+                                    workflowStateToDelete: String,
+                                    workflowStateForUpdate: String)
+                                   (implicit ec: ExecutionContext): Future[(Int, Option[Boolean])]
 
   /**
     * Adds the requested WorkflowSourceFiles to the store.
@@ -56,10 +53,18 @@ ____    __    ____  ______   .______       __  ___  _______  __        ______   
     * Retrieves up to limit workflows which have not already been pulled into the engine and updates their state.
     * NOTE: Rows are returned with the query state, NOT the update state.
     */
-  def fetchStartableWorkflows(limit: Int, cromwellId: String, heartbeatTtl: FiniteDuration)
-                             (implicit ec: ExecutionContext): Future[Seq[WorkflowStoreEntry]]
+  def fetchWorkflowsInState(limit: Int,
+                            cromwellId: String,
+                            heartbeatTimestampStart: Timestamp,
+                            heartbeatTimestampTo: Timestamp,
+                            workflowStateFrom: String,
+                            workflowStateTo: String,
+                            workflowStateExcluded: String)
+                           (implicit ec: ExecutionContext): Future[Seq[WorkflowStoreEntry]]
 
-  def writeWorkflowHeartbeats(workflowExecutionUuids: Set[String])(implicit ec: ExecutionContext): Future[Int]
+  def writeWorkflowHeartbeats(workflowExecutionUuids: Set[String],
+                              heartbeatTimestampOption: Option[Timestamp])
+                             (implicit ec: ExecutionContext): Future[Int]
 
   /**
     * Clears out cromwellId and heartbeatTimestamp for all workflow store entries currently assigned
@@ -71,8 +76,12 @@ ____    __    ____  ______   .______       __  ___  _______  __        ______   
     * Deletes a workflow from the database, returning the number of rows affected.
     */
   def removeWorkflowStoreEntry(workflowExecutionUuid: String)(implicit ec: ExecutionContext): Future[Int]
-  
-  def stats(implicit ec: ExecutionContext): Future[Map[WorkflowStoreState, Int]]
 
-  def setOnHoldToSubmitted(workflowId: String)(implicit ec: ExecutionContext): Future[Unit]
+  def workflowStateCounts(implicit ec: ExecutionContext): Future[Map[String, Int]]
+
+  /**
+    * Returns the number of rows updated from on-hold to submitted.
+    */
+  def setOnHoldToSubmitted(workflowExecutionUuid: String, fromWorkflowState: String, toWorkflowState: String)
+                          (implicit ec: ExecutionContext): Future[Int]
 }

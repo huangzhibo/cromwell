@@ -2,9 +2,9 @@ package cromwell.engine.workflow.workflowstore
 
 import cats.data.NonEmptyList
 import cromwell.core.{WorkflowId, WorkflowSourceFilesCollection}
-import cromwell.database.sql.tables.WorkflowStoreEntry.WorkflowStoreState
-import cromwell.database.sql.tables.WorkflowStoreEntry.WorkflowStoreState.WorkflowStoreState
-import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.WorkflowSubmissionResponse
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.WorkflowStoreAbortResponse.WorkflowStoreAbortResponse
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.WorkflowStoreState.WorkflowStoreState
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.{WorkflowStoreAbortResponse, WorkflowStoreState, WorkflowSubmissionResponse}
 
 import scala.concurrent.duration.FiniteDuration
 import scala.concurrent.{ExecutionContext, Future}
@@ -43,15 +43,6 @@ class InMemoryWorkflowStore extends WorkflowStore {
     Future.successful(workflowsToStart.toList)
   }
 
-  override def remove(id: WorkflowId)(implicit ec: ExecutionContext): Future[Boolean] = {
-    if (workflowStore.exists(_._1.id == id)) {
-      workflowStore = workflowStore filterNot { _._1.id == id }
-      Future.successful(true)
-    } else {
-      Future.successful(false)
-    }
-  }
-
   override def initialize(implicit ec: ExecutionContext): Future[Unit] = Future.successful(())
 
   override def stats(implicit ec: ExecutionContext): Future[Map[WorkflowStoreState, Int]] = Future.successful(Map(WorkflowStoreState.Submitted -> workflowStore.size))
@@ -64,14 +55,20 @@ class InMemoryWorkflowStore extends WorkflowStore {
     Future.successful(())
   }
 
-  override def aborting(id: WorkflowId)(implicit ec: ExecutionContext): Future[Option[Boolean]] = {
-    if (workflowStore.exists(_._1.id == id)) {
-      val state = workflowStore.find(_._1.id == id)
-      workflowStore = workflowStore ++ workflowStore.find(_._1.id == id).map({ _._1 -> WorkflowStoreState.Aborting }).toMap
-      // In memory workflows can never be restarted (since this is destroyed on a server restart)
-      Future.successful(state.map(_ => false))
-    } else {
-      Future.successful(None)
+  override def aborting(id: WorkflowId)(implicit ec: ExecutionContext): Future[WorkflowStoreAbortResponse] = {
+    workflowStore collectFirst {
+      case (submittedWorkflow, workflowStoreState) if submittedWorkflow.id == id =>
+        (submittedWorkflow, workflowStoreState)
+    } match {
+      case Some((submittedWorkflow, WorkflowStoreState.OnHold)) =>
+        workflowStore -= submittedWorkflow
+        Future.successful(WorkflowStoreAbortResponse.AbortedOnHold)
+      case Some((submittedWorkflow, _)) =>
+        workflowStore += submittedWorkflow -> WorkflowStoreState.Aborting
+        // In memory workflows can never be restarted (since this is destroyed on a server restart)
+        Future.successful(WorkflowStoreAbortResponse.AbortingHeartbeatTimestampNonEmpty)
+      case None =>
+        Future.successful(WorkflowStoreAbortResponse.NotFound)
     }
   }
 
