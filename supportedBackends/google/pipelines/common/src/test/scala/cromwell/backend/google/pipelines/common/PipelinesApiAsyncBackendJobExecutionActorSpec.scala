@@ -184,7 +184,10 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
           womDefinition,
           inputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val job = workflowDescriptor.callable.taskCallNodes.head
@@ -193,7 +196,7 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
         val prefetchedKvEntries = Map(
           PipelinesApiBackendLifecycleActorFactory.preemptionCountKey -> KvPair(ScopedKey(workflowDescriptor.id, KvJobKey(key), PipelinesApiBackendLifecycleActorFactory.preemptionCountKey), previousPreemptions.toString),
           PipelinesApiBackendLifecycleActorFactory.unexpectedRetryCountKey -> KvPair(ScopedKey(workflowDescriptor.id, KvJobKey(key), PipelinesApiBackendLifecycleActorFactory.unexpectedRetryCountKey), previousUnexpectedRetries.toString))
-        BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(Inputs), NoDocker, prefetchedKvEntries)
+        BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(Inputs), NoDocker, None, prefetchedKvEntries)
       case Left(badtimes) => fail(badtimes.toList.mkString(", "))
     }
   }
@@ -362,6 +365,36 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
     retryableHandle.throwable.getMessage should include("will be restarted with another preemptible VM")
   }
 
+  it should "treat a PAPI v2 style error message as preemptible if the VM was preemptible" in {
+    val actorRef = buildPreemptibleTestActorRef(1, 2)
+    val jesBackend = actorRef.underlyingActor
+    val runId = StandardAsyncJob(UUID.randomUUID().toString)
+    val handle = new JesPendingExecutionHandle(null, runId, None, None)
+
+    val failedStatus = UnsuccessfulRunStatus(Status.ABORTED, Option(PipelinesApiAsyncBackendJobExecutionActor.FailedV2Style), Seq.empty, Option("fakeMachine"), Option("fakeZone"), Option("fakeInstance"), wasPreemptible = true)
+    val executionResult = jesBackend.handleExecutionResult(failedStatus, handle)
+    val result = Await.result(executionResult, timeout)
+    result.isInstanceOf[FailedRetryableExecutionHandle] shouldBe true
+    val retryableHandle = result.asInstanceOf[FailedRetryableExecutionHandle]
+    retryableHandle.returnCode shouldBe None
+    retryableHandle.throwable.getMessage should include("will be restarted with another preemptible VM")
+  }
+
+  it should "when at the preemptible limit restart a PAPI v2 style error message with a non-preemptible VM" in {
+    val actorRef = buildPreemptibleTestActorRef(1, 1)
+    val jesBackend = actorRef.underlyingActor
+    val runId = StandardAsyncJob(UUID.randomUUID().toString)
+    val handle = new JesPendingExecutionHandle(null, runId, None, None)
+
+    val failedStatus = UnsuccessfulRunStatus(Status.ABORTED, Option(PipelinesApiAsyncBackendJobExecutionActor.FailedV2Style), Seq.empty, Option("fakeMachine"), Option("fakeZone"), Option("fakeInstance"), wasPreemptible = true)
+    val executionResult = jesBackend.handleExecutionResult(failedStatus, handle)
+    val result = Await.result(executionResult, timeout)
+    result.isInstanceOf[FailedRetryableExecutionHandle] shouldBe true
+    val retryableHandle = result.asInstanceOf[FailedRetryableExecutionHandle]
+    retryableHandle.returnCode shouldBe None
+    retryableHandle.throwable.getMessage should include("The call will be restarted with a non-preemptible VM.")
+  }
+
   it should "handle Failure Status for various errors" in {
     val actorRef = buildPreemptibleTestActorRef(1, 1)
     val jesBackend = actorRef.underlyingActor
@@ -411,13 +444,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val call: CommandCallNode = workflowDescriptor.callable.graph.nodes.collectFirst({ case t: CommandCallNode => t }).get
         val key = BackendJobDescriptorKey(call, None, 1)
         val runtimeAttributes = makeRuntimeAttributes(call)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
         val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -484,13 +520,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val job: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
         val runtimeAttributes = makeRuntimeAttributes(job)
         val key = BackendJobDescriptorKey(job, None, 1)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
         val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -532,13 +571,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.find(_.localName == callName).get
         val key = BackendJobDescriptorKey(call, None, 1)
         val runtimeAttributes = makeRuntimeAttributes(call)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration, functions))
         TestActorRef[TestablePipelinesApiJobExecutionActor](props, s"TestableJesJobExecutionActor-${jobDescriptor.workflowDescriptor.id}")
@@ -600,13 +642,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val job: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
         val runtimeAttributes = makeRuntimeAttributes(job)
         val key = BackendJobDescriptorKey(job, None, 1)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
         val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -635,13 +680,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val job: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
         val runtimeAttributes = makeRuntimeAttributes(job)
         val key = BackendJobDescriptorKey(job, None, 1)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
         val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -684,13 +732,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
         Seq.empty[Draft2ImportResolver]).get.workflow.toWomWorkflowDefinition(isASubworkflow = false).getOrElse(fail("failed to get WomDefinition from WdlWorkflow")),
       Map.empty,
       NoOptions,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
     val key = BackendJobDescriptorKey(call, None, 1)
     val runtimeAttributes = makeRuntimeAttributes(call)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
     val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -718,13 +769,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
         Seq.empty[Draft2ImportResolver]).get.workflow.toWomWorkflowDefinition(isASubworkflow = false).getOrElse(fail("failed to get WomDefinition from WdlWorkflow")),
       Map.empty,
       WorkflowOptions.fromJsonString("""{"monitoring_script": "gs://path/to/script"}""").get,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val job: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
     val runtimeAttributes = makeRuntimeAttributes(job)
     val key = BackendJobDescriptorKey(job, None, 1)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
     val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -741,13 +795,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
         Seq.empty[Draft2ImportResolver]).get.workflow.toWomWorkflowDefinition(isASubworkflow = false).getOrElse(fail("failed to get WomDefinition from WdlWorkflow")),
       Map.empty,
       NoOptions,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val job: CommandCallNode = workflowDescriptor.callable.graph.nodes.collectFirst({case t: CommandCallNode => t}).get
     val key = BackendJobDescriptorKey(job, None, 1)
     val runtimeAttributes = makeRuntimeAttributes(job)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
     val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -764,13 +821,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
         Seq.empty[Draft2ImportResolver]).get.workflow.toWomWorkflowDefinition(isASubworkflow = false).getOrElse(fail("failed to get WomDefinition from WdlWorkflow")),
       Map.empty,
       WorkflowOptions.fromJsonString(""" {"jes_gcs_root": "gs://path/to/gcs_root"} """).get,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.find(_.localName == "hello").get
     val key = BackendJobDescriptorKey(call, None, 1)
     val runtimeAttributes = makeRuntimeAttributes(call)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
     val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -797,13 +857,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
         Seq.empty[Draft2ImportResolver]).get.workflow.toWomWorkflowDefinition(isASubworkflow = false).getOrElse(fail("failed to get WomDefinition from WdlWorkflow")),
       Map.empty,
       WorkflowOptions.fromJsonString(""" {"jes_gcs_root": "gs://path/to/gcs_root"} """).get,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.find(_.localName == "B").get
     val key = BackendJobDescriptorKey(call, Option(2), 1)
     val runtimeAttributes = makeRuntimeAttributes(call)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
     val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -868,13 +931,16 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
             |}
             |""".stripMargin
       ).get,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.find(_.localName == "goodbye").get
     val key = BackendJobDescriptorKey(call, None, 1)
     val runtimeAttributes = makeRuntimeAttributes(call)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestablePipelinesApiJobExecutionActor(jobDescriptor, Promise(), papiConfiguration))
     val testActorRef = TestActorRef[TestablePipelinesApiJobExecutionActor](
@@ -885,8 +951,6 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
     val actual = jesBackend.startMetadataKeyValues.safeMapValues(_.toString)
     actual should be(
       Map(
-        "backendLabels:cromwell-workflow-id" -> s"cromwell-$workflowId",
-        "backendLabels:wdl-task-name" -> "goodbye",
         "backendLogs:log" -> s"$jesGcsRoot/wf_hello/$workflowId/call-goodbye/goodbye.log",
         "callRoot" -> s"$jesGcsRoot/wf_hello/$workflowId/call-goodbye",
         "jes:endpointUrl" -> "https://genomics.googleapis.com/",
@@ -902,8 +966,8 @@ class PipelinesApiAsyncBackendJobExecutionActorSpec extends TestKitSuite("JesAsy
         "runtimeAttributes:disks" -> "local-disk 200 SSD",
         "runtimeAttributes:docker" -> "ubuntu:latest",
         "runtimeAttributes:failOnStderr" -> "false",
-        "runtimeAttributes:memory" -> "2.048 GB",
-        "runtimeAttributes:memoryMin" -> "2.048 GB",
+        "runtimeAttributes:memory" -> "2 GB",
+        "runtimeAttributes:memoryMin" -> "2 GB",
         "runtimeAttributes:noAddress" -> "false",
         "runtimeAttributes:preemptible" -> "0",
         "runtimeAttributes:zones" -> "us-central1-b,us-central1-a",

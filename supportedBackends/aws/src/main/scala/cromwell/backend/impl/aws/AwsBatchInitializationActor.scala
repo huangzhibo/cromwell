@@ -34,17 +34,17 @@ package cromwell.backend.impl.aws
 import java.io.IOException
 
 import akka.actor.ActorRef
-import software.amazon.awssdk.core.auth.AwsCredentials
+import software.amazon.awssdk.auth.credentials.AwsCredentials
 import cromwell.filesystems.s3.batch.S3BatchCommandBuilder
 import cromwell.backend.standard.{StandardInitializationActor,
                                   StandardInitializationActorParams,
                                   StandardValidatedRuntimeAttributesBuilder}
 import cromwell.backend.{BackendConfigurationDescriptor,
                          BackendWorkflowDescriptor}
+import cromwell.core.io.DefaultIoCommandBuilder
 import cromwell.core.io.AsyncIoActorClient
 import cromwell.core.path.Path
 import wom.graph.CommandCallNode
-
 import scala.concurrent.Future
 
 case class AwsBatchInitializationActorParams
@@ -86,5 +86,14 @@ class AwsBatchInitializationActor(params: AwsBatchInitializationActorParams)
     creds <- credentials
   } yield AwsBatchBackendInitializationData(workflowPaths, runtimeAttributesBuilder, configuration, creds)
 
-  override lazy val ioCommandBuilder = S3BatchCommandBuilder
+  override lazy val ioCommandBuilder =  {
+    val conf = Option(configuration) match {
+      case Some(cf) => cf
+      case None =>  new  AwsBatchConfiguration(params.configurationDescriptor)
+    }
+    conf.fileSystem match {
+      case  AWSBatchStorageSystems.s3 =>  S3BatchCommandBuilder
+      case _ =>   DefaultIoCommandBuilder
+    }
+  }
 }

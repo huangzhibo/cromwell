@@ -9,7 +9,7 @@ import common.collections.EnhancedCollections._
 import cromwell.backend.google.pipelines.common.PipelinesApiInitializationActorSpec._
 import cromwell.backend.google.pipelines.common.PipelinesApiTestConfig.genomicsFactory
 import cromwell.backend.google.pipelines.common.authentication.{GcsLocalizing, PipelinesApiAuthObject}
-import cromwell.backend.google.pipelines.common.{PipelinesApiAttributes, PipelinesApiConfiguration, PipelinesApiInitializationActorParams}
+import cromwell.backend.google.pipelines.common.{PipelinesApiConfigurationAttributes, PipelinesApiConfiguration, PipelinesApiInitializationActorParams}
 import cromwell.backend.{BackendConfigurationDescriptor, BackendSpec, BackendWorkflowDescriptor}
 import cromwell.cloudsupport.gcp.GoogleConfiguration
 import cromwell.cloudsupport.gcp.auth.{RefreshTokenMode, SimpleClientSecrets}
@@ -96,7 +96,7 @@ class PipelinesApiInitializationActorSpec extends TestKitSuite("PipelinesApiInit
     val calls = workflowDescriptor.callable.taskCallNodes
     val backendConfigurationDescriptor = BackendConfigurationDescriptor(backendConfig, globalConfig)
     val customGoogleConfig = GoogleConfiguration(globalConfig)
-    val customAttributes = PipelinesApiAttributes(customGoogleConfig, backendConfig)
+    val customAttributes = PipelinesApiConfigurationAttributes(customGoogleConfig, backendConfig)
     val jesConfiguration = new PipelinesApiConfiguration(backendConfigurationDescriptor, genomicsFactory, customGoogleConfig, customAttributes)
 
     val actorRef = TestActorRef[PipelinesApiInitializationActor](
@@ -196,7 +196,7 @@ class PipelinesApiInitializationActorSpec extends TestKitSuite("PipelinesApiInit
       restrictMetadataAccess = false
     )
     authJsonOption shouldNot be(empty)
-    authJsonOption.get should be(
+    normalize(authJsonOption.get) should be(
       normalize(
         """
           |{
@@ -229,7 +229,7 @@ class PipelinesApiInitializationActorSpec extends TestKitSuite("PipelinesApiInit
       restrictMetadataAccess = true
     )
     authJsonOption shouldNot be(empty)
-    authJsonOption.get should be(
+    normalize(authJsonOption.get) should be(
       normalize(
         """
           |{

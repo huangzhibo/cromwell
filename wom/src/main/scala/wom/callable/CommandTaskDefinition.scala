@@ -12,7 +12,7 @@ import wom.expression.{IoFunctionSet, WomExpression}
 import wom.graph.GraphNodePort.OutputPort
 import wom.graph.{Graph, TaskCall}
 import wom.values.{WomEvaluatedCallInputs, WomGlobFile, WomValue}
-import wom.{CommandPart, InstantiatedCommand, RuntimeAttributes}
+import wom.{CommandPart, InstantiatedCommand, RuntimeAttributes, SourceFileLocation}
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Try
@@ -31,7 +31,7 @@ object CommandTaskDefinition {
 
   // Function definition to evaluate task outputs
   type OutputEvaluationFunction = (Set[OutputPort], Map[String, WomValue], IoFunctionSet, ExecutionContext) => OutputFunctionResponse
-  
+
   object OutputEvaluationFunction {
     val none: OutputEvaluationFunction = { case (_ ,_, _, _) => OptionT[Future, EvaluatedOutputs](Future.successful(None)) }
   }
@@ -55,8 +55,8 @@ object CommandTaskDefinition {
   */
 sealed trait TaskDefinition extends Callable {
   def runtimeAttributes: RuntimeAttributes
-  def meta: Map[String, String]
-  def parameterMeta: Map[String, String]
+  def meta: Map[String, MetaValueElement]
+  def parameterMeta: Map[String, MetaValueElement]
 
   /**
     * Transform the Callable TaskDefinition to an ExecutableCallable that can be executed on its own.
@@ -137,8 +137,8 @@ sealed trait CommandTaskDefinition extends TaskDefinition {
 final case class CallableTaskDefinition(name: String,
                                         commandTemplateBuilder: WomEvaluatedCallInputs => ErrorOr[Seq[CommandPart]],
                                         runtimeAttributes: RuntimeAttributes,
-                                        meta: Map[String, String],
-                                        parameterMeta: Map[String, String],
+                                        meta: Map[String, MetaValueElement],
+                                        parameterMeta: Map[String, MetaValueElement],
                                         outputs: List[Callable.OutputDefinition],
                                         inputs: List[_ <: Callable.InputDefinition],
                                         adHocFileCreation: Set[ContainerizedInputExpression],
@@ -151,7 +151,8 @@ final case class CallableTaskDefinition(name: String,
                                         additionalGlob: Option[WomGlobFile] = None,
                                         private [wom] val customizedOutputEvaluation: OutputEvaluationFunction = OutputEvaluationFunction.none,
                                         homeOverride: Option[RuntimeEnvironment => String] = None,
-                                        dockerOutputDirectory: Option[String] = None
+                                        dockerOutputDirectory: Option[String] = None,
+                                        override val sourceLocation : Option[SourceFileLocation]
                                        ) extends CommandTaskDefinition {
   def toExecutable: ErrorOr[ExecutableTaskDefinition] = TaskCall.graphFromDefinition(this) map { ExecutableTaskDefinition(this, _) }
 }
@@ -197,8 +198,8 @@ sealed trait ExpressionTaskDefinition extends TaskDefinition {
 final case class CallableExpressionTaskDefinition(name: String,
                                                   evaluate: (Map[String, WomValue], IoFunctionSet, List[OutputPort]) => Checked[Map[OutputPort, WomValue]],
                                                   runtimeAttributes: RuntimeAttributes,
-                                                  meta: Map[String, String],
-                                                  parameterMeta: Map[String, String],
+                                                  meta: Map[String, MetaValueElement],
+                                                  parameterMeta: Map[String, MetaValueElement],
                                                   outputs: List[Callable.OutputDefinition],
                                                   inputs: List[_ <: Callable.InputDefinition],
                                                   prefixSeparator: String = ".",

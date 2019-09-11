@@ -37,6 +37,7 @@ import cats.data.Kleisli._
 import cats.data.ReaderT._
 import cats.implicits._
 
+import cromwell.core.ExecutionIndex._
 import scala.language.higherKinds
 import cats.effect.{Async, Timer}
 import software.amazon.awssdk.services.batch.BatchClient
@@ -45,9 +46,11 @@ import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient
 import software.amazon.awssdk.services.cloudwatchlogs.model.{GetLogEventsRequest, OutputLogEvent}
 import cromwell.backend.BackendJobDescriptor
 import cromwell.backend.io.JobPaths
+import cromwell.cloudsupport.aws.auth.AwsAuthMode
 import org.slf4j.LoggerFactory
 import fs2.Stream
-import software.amazon.awssdk.core.regions.Region
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
+import software.amazon.awssdk.regions.Region
 
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
@@ -73,15 +76,19 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
                              outputs: Set[AwsBatchFileOutput],
                              jobPaths: JobPaths, // Based on config, calculated in Job Paths, key to all things outside container
                              parameters: Seq[AwsBatchParameter],
-                             configRegion: Option[Region]
+                             configRegion: Option[Region],
+                             optAwsAuthMode: Option[AwsAuthMode] = None
                              ) {
 
   val Log = LoggerFactory.getLogger(AwsBatchJob.getClass)
   // TODO: Auth, endpoint
   lazy val client = {
-   val builder = BatchClient.builder()
-   configRegion.foreach(builder.region)
-   builder.build
+    val builder = BatchClient.builder()
+    optAwsAuthMode.foreach { awsAuthMode =>
+      builder.credentialsProvider(StaticCredentialsProvider.create(awsAuthMode.credential(_ => "")))
+    }
+    configRegion.foreach(builder.region)
+    builder.build
   }
   lazy val logsclient = {
     val builder = CloudWatchLogsClient.builder()
@@ -104,25 +111,25 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
     //       later, so I'm leaving it here for potential future use.
     script.concat(s"""
     |echo "MIME-Version: 1.0
-    |Content-Type: multipart/alternative; boundary="${boundary}"
-
-    |--${boundary}
+    |Content-Type: multipart/alternative; boundary="$boundary"
+    |
+    |--$boundary
     |Content-Type: text/plain
     |Content-Disposition: attachment; filename="rc.txt"
     |"
-    |cat ${dockerRc}
-    |echo "--${boundary}
+    |cat $dockerRc
+    |echo "--$boundary
     |Content-Type: text/plain
     |Content-Disposition: attachment; filename="stdout.txt"
     |"
-    |cat ${dockerStdout}
-    |echo "--${boundary}
+    |cat $dockerStdout
+    |echo "--$boundary
     |Content-Type: text/plain
     |Content-Disposition: attachment; filename="stderr.txt"
     |"
-    |cat ${dockerStderr}
-    |echo "--${boundary}--"
-    |exit $$(cat ${dockerRc})
+    |cat $dockerStderr
+    |echo "--$boundary--"
+    |exit 0
     """).stripMargin
   }
   def submitJob[F[_]]()(
@@ -131,9 +138,9 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
     val taskId = jobDescriptor.key.call.fullyQualifiedName + "-" + jobDescriptor.key.index + "-" + jobDescriptor.key.attempt
     val workflow = jobDescriptor.workflowDescriptor
     val uniquePath = workflow.callable.name + "/" +
-                     jobDescriptor.taskCall.callable.name + "/" +
+                     jobDescriptor.taskCall.localName + "/" +
                      workflow.id + "/" +
-                     jobDescriptor.key.index + "/" +
+                     jobDescriptor.key.index.fromIndex + "/" +
                      jobDescriptor.key.attempt
     Log.info(s"""Submitting job to AWS Batch""")
     Log.info(s"""dockerImage: ${runtimeAttributes.dockerImage}""")
@@ -158,7 +165,7 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
         }).compile.last.map(_.get)) //if successful there is guaranteed to be a value emitted, hence we can .get this option
     }
 
-    (createDefinition[F](s"""${workflow.callable.name}-${jobDescriptor.taskCall.callable.name}""", uniquePath) product Kleisli.ask[F, AwsBatchAttributes]).
+    (createDefinition[F](s"""${workflow.callable.name}-${jobDescriptor.taskCall.localName}""", uniquePath) product Kleisli.ask[F, AwsBatchAttributes]).
       flatMap((callClient _).tupled)
   }
 
@@ -173,9 +180,13 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
                                      implicit async: Async[F],
                                      timer: Timer[F]): Aws[F, String] = ReaderT { awsBatchAttributes =>
     val jobDefinitionBuilder = StandardAwsBatchJobDefinitionBuilder
+    val commandStr = awsBatchAttributes.fileSystem match {
+      case AWSBatchStorageSystems.s3  => reconfiguredScript
+      case _ => script
+    }
     val jobDefinitionContext = AwsBatchJobDefinitionContext(runtimeAttributes,
                                                             taskId,
-                                                            reconfiguredScript,
+                                                            commandStr,
                                                             dockerRc,
                                                             dockerStdout,
                                                             dockerStderr,
@@ -234,9 +245,10 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
    *  @return Current RunStatus
    *
    */
-  def status(jobId: String): Try[RunStatus] = {
-     RunStatus.fromJobStatus(detail(jobId).status, jobId)
-  }
+  def status(jobId: String): Try[RunStatus] = for {
+    statusString <- Try(detail(jobId).status)
+    runStatus <- RunStatus.fromJobStatus(statusString, jobId)
+  } yield runStatus
 
   def detail(jobId: String): JobDetail = {
     //TODO: This client call should be wrapped in a cats Effect

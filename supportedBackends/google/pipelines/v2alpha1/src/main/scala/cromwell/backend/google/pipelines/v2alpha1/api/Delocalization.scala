@@ -2,10 +2,11 @@ package cromwell.backend.google.pipelines.v2alpha1.api
 
 import java.util.UUID
 
-import akka.http.scaladsl.model.ContentTypes
 import com.google.api.services.genomics.v2alpha1.model.{Action, Mount}
 import common.util.StringUtil._
-import cromwell.backend.google.pipelines.common.PipelinesApiAttributes.LocalizationConfiguration
+import cromwell.backend.google.pipelines.common.PipelinesApiAsyncBackendJobExecutionActor
+import cromwell.backend.google.pipelines.common.PipelinesApiConfigurationAttributes.LocalizationConfiguration
+import cromwell.backend.google.pipelines.common.PipelinesApiJobPaths.GcsDelocalizationScriptName
 import cromwell.backend.google.pipelines.common.api.PipelinesApiRequestFactory.CreatePipelineParameters
 import cromwell.backend.google.pipelines.v2alpha1.PipelinesConversions._
 import cromwell.backend.google.pipelines.v2alpha1.RuntimeOutputMapping
@@ -15,7 +16,6 @@ import cromwell.backend.google.pipelines.v2alpha1.api.ActionBuilder._
 import cromwell.backend.google.pipelines.v2alpha1.api.ActionCommands._
 import cromwell.backend.google.pipelines.v2alpha1.api.Delocalization._
 import cromwell.core.path.{DefaultPathBuilder, Path}
-import org.apache.commons.codec.binary.Base64
 import wom.runtime.WomOutputRuntimeExtractor
 
 import scala.collection.JavaConverters._
@@ -23,7 +23,6 @@ import scala.concurrent.duration._
 
 object Delocalization {
   private val logsRoot = "/google/logs"
-  val plainTextContentType = Option(ContentTypes.`text/plain(UTF-8)`)
 }
 
 trait Delocalization {
@@ -32,21 +31,21 @@ trait Delocalization {
 
   private def delocalizeLogsAction(gcsLogPath: Path)(implicit localizationConfiguration: LocalizationConfiguration) = {
     cloudSdkShellAction(
-    delocalizeDirectory(DefaultPathBuilder.build(logsRoot).get, gcsLogPath, plainTextContentType)
+    delocalizeDirectory(DefaultPathBuilder.build(logsRoot).get, gcsLogPath, PipelinesApiAsyncBackendJobExecutionActor.plainTextContentType)
     )(flags = List(ActionFlag.AlwaysRun), labels = Map(Key.Tag -> Value.Delocalization))
   }
 
   // Used for the final copy of the logs to make sure we have the most up to date version before terminating the job
   private def copyAggregatedLogToLegacyPath(callExecutionContainerRoot: Path, gcsLegacyLogPath: Path)(implicit localizationConfiguration: LocalizationConfiguration): Action = {
     cloudSdkShellAction(
-      delocalizeFileTo(DefaultPathBuilder.build(aggregatedLog).get, gcsLegacyLogPath, plainTextContentType)
+      delocalizeFileTo(DefaultPathBuilder.build(aggregatedLog).get, gcsLegacyLogPath, PipelinesApiAsyncBackendJobExecutionActor.plainTextContentType)
     )(flags = List(ActionFlag.AlwaysRun), labels = Map(Key.Tag -> Value.Delocalization))
   }
 
   // Periodically copies the logs out to GCS
   private def copyAggregatedLogToLegacyPathPeriodic(callExecutionContainerRoot: Path, gcsLegacyLogPath: Path)(implicit localizationConfiguration: LocalizationConfiguration): Action = {
     cloudSdkShellAction(
-      every(30.seconds) { delocalizeFileTo(DefaultPathBuilder.build(aggregatedLog).get, gcsLegacyLogPath, plainTextContentType) }
+      every(30.seconds) { delocalizeFileTo(DefaultPathBuilder.build(aggregatedLog).get, gcsLegacyLogPath, PipelinesApiAsyncBackendJobExecutionActor.plainTextContentType) }
     )(flags = List(ActionFlag.RunInBackground), labels = Map(Key.Tag -> Value.Background))
   }
 
@@ -59,7 +58,8 @@ trait Delocalization {
       // Create the directory where the fofn will be written
       s"mkdir -p $$(dirname $outputFile) && " +
       s"cd $containerCallRoot && " +
-      s"${womOutputRuntimeExtractor.command} > $outputFile"
+      """echo "Runtime output files to be delocalized:" && """ +
+      s"${womOutputRuntimeExtractor.command} | tee $outputFile"
     )
 
     ActionBuilder
@@ -71,14 +71,14 @@ trait Delocalization {
       .withFlags(List(ActionFlag.DisableImagePrefetch))
       .withLabels(Map(Key.Tag -> Value.Delocalization))
   }
-  
-  private def delocalizeRuntimeOutputsScript(fofnPath: String, workflowRoot: Path, cloudCallRoot: Path) = {
+
+  private def delocalizeRuntimeOutputsScript(fofnPath: String, workflowRoot: Path, cloudCallRoot: Path)(implicit localizationConfiguration: LocalizationConfiguration) = {
     val gsutilCommand: String => String = { flag =>
-      s"""gsutil -m $flag cp -r $$line "${cloudCallRoot.pathAsString.ensureSlashed}$$gcs_path""""
+      s"""rm -f $$HOME/.config/gcloud/gce && gsutil -m $flag cp -r $$line "${cloudCallRoot.pathAsString.ensureSlashed}$$gcs_path""""
     }
-    
+
     def sedStripPrefix(prefix: String) = s"""sed -e "s/^${prefix.ensureSedEscaped}//""""
-    
+
     // See RuntimeOutputMapping.prefixFilters for more info on why this is needed
     val prefixFilters = RuntimeOutputMapping
       .prefixFilters(workflowRoot)
@@ -96,23 +96,14 @@ trait Delocalization {
         |  while IFS= read line
         |  do
         |    gcs_path=$$(echo $$line | $prefixFilters)
-        |    ${recoverRequesterPaysError(cloudCallRoot)(gsutilCommand)}
+        |    (
+        |       ${retry(recoverRequesterPaysError(cloudCallRoot)(gsutilCommand))}
+        |    )
         |  done  <$fofnPath
         |fi""".stripMargin
   }
 
-  private def delocalizeRuntimeOutputsAction(cloudCallRoot: Path, inputFile: String, workflowRoot: Path, mounts: List[Mount]): Action = {
-    def multiLineCommand(commandString: String) = {
-      val randomUuid = UUID.randomUUID().toString
-      val base64EncodedScript = Base64.encodeBase64String(commandString.getBytes)
-      val scriptPath = s"/tmp/$randomUuid.sh"
-
-      s"apt-get install --assume-yes coreutils && " +
-        s"echo $base64EncodedScript | base64 --decode > $scriptPath && " +
-        s"chmod u+x $scriptPath && " +
-        s"sh $scriptPath"
-    }
-    
+  private def delocalizeRuntimeOutputsAction(cloudCallRoot: Path, inputFile: String, workflowRoot: Path, mounts: List[Mount])(implicit localizationConfiguration: LocalizationConfiguration): Action = {
     val command = multiLineCommand(delocalizeRuntimeOutputsScript(inputFile, workflowRoot, cloudCallRoot))
     ActionBuilder.cloudSdkShellAction(command)(mounts, flags = List(ActionFlag.DisableImagePrefetch), labels = Map(Key.Tag -> Value.Delocalization))
   }
@@ -126,26 +117,32 @@ trait Delocalization {
     val gcsLegacyLogPath = createPipelineParameters.logGcsPath
 
     /*
-     * CWL specific delocalization. For now this always runs, even for WDL jobs.
-     * Ideally temporaryFofnForCwlOutputJson should be somewhere else than the execution directory (we could mount anther directory)
+     * Ideally temporaryFofnForRuntimeOutputFiles should be somewhere else than the execution directory (we could mount anther directory)
      * However because it runs after everything else there's no risk of polluting the task's results and the random ID ensures we don't override anything
      */
-    val temporaryFofnDirectoryForCwlOutputJson = callExecutionContainerRoot.pathAsString.ensureSlashed + UUID.randomUUID().toString.split("-")(0)
-    val temporaryFofnForCwlOutputJson = temporaryFofnDirectoryForCwlOutputJson + "/cwl_output_json_references.txt"
+    val temporaryFofnDirectoryForRuntimeOutputFiles = callExecutionContainerRoot.pathAsString.ensureSlashed + UUID.randomUUID().toString.split("-")(0)
+    val temporaryFofnForRuntimeOutputFiles = temporaryFofnDirectoryForRuntimeOutputFiles + "/runtime_output_files.txt"
 
     val runtimeExtractionActions = createPipelineParameters.womOutputRuntimeExtractor.toList flatMap { extractor =>
       List (
-        runtimeOutputExtractorAction(callExecutionContainerRoot.pathAsString, temporaryFofnForCwlOutputJson, mounts, extractor),
-        delocalizeRuntimeOutputsAction(cloudCallRoot, temporaryFofnForCwlOutputJson, createPipelineParameters.cloudWorkflowRoot, mounts)
+        runtimeOutputExtractorAction(callExecutionContainerRoot.pathAsString, temporaryFofnForRuntimeOutputFiles, mounts, extractor),
+        delocalizeRuntimeOutputsAction(cloudCallRoot, temporaryFofnForRuntimeOutputFiles, createPipelineParameters.cloudWorkflowRoot, mounts)
       )
     }
 
+    val gcsDelocalizationContainerPath = createPipelineParameters.commandScriptContainerPath.sibling(GcsDelocalizationScriptName)
+
+    val delocalizationLabel = Map(Key.Tag -> Value.Delocalization)
+    val runGcsDelocalizationScript: Action = cloudSdkShellAction(
+      s"/bin/bash $gcsDelocalizationContainerPath")(mounts = mounts, labels = delocalizationLabel)
+
     ActionBuilder.annotateTimestampedActions("delocalization", Value.Delocalization)(
-      createPipelineParameters.outputParameters.flatMap(_.toActions(mounts).toList) ++
+      runGcsDelocalizationScript ::
+        createPipelineParameters.outputParameters.flatMap(_.toActions(mounts).toList) ++
         runtimeExtractionActions
     ) :+
       copyAggregatedLogToLegacyPath(callExecutionContainerRoot, gcsLegacyLogPath) :+
-      copyAggregatedLogToLegacyPathPeriodic(callExecutionContainerRoot, createPipelineParameters.logGcsPath) :+
+      copyAggregatedLogToLegacyPathPeriodic(callExecutionContainerRoot, gcsLegacyLogPath) :+
       delocalizeLogsAction(gcsLogDirectoryPath)
   }
 }

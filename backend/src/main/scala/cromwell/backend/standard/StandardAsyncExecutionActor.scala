@@ -15,10 +15,12 @@ import common.exception.MessageAggregation
 import common.util.StringUtil._
 import common.util.TryUtil
 import common.validation.ErrorOr.{ErrorOr, ShortCircuitingFlatMap}
+import common.validation.IOChecked._
 import common.validation.Validation._
 import cromwell.backend.BackendJobExecutionActor.{BackendJobExecutionResponse, JobAbortedResponse, JobReconnectionNotSupportedException}
 import cromwell.backend.BackendLifecycleActor.AbortJobCommand
 import cromwell.backend.OutputEvaluator._
+import cromwell.backend.SlowJobWarning.{WarnAboutSlownessAfter, WarnAboutSlownessIfNecessary}
 import cromwell.backend._
 import cromwell.backend.async.AsyncBackendJobExecutionActor._
 import cromwell.backend.async._
@@ -32,11 +34,11 @@ import cromwell.services.keyvalue.KvClient
 import cromwell.services.metadata.CallMetadataKeys
 import mouse.all._
 import net.ceedubs.ficus.Ficus._
+import org.apache.commons.lang3.StringUtils
 import shapeless.Coproduct
 import wom.callable.{AdHocValue, CommandTaskDefinition, ContainerizedInputExpression, RuntimeEnvironment}
 import wom.expression.WomExpression
 import wom.graph.LocalName
-import wom.values.LazyWomFile._
 import wom.values._
 import wom.{CommandSetupSideEffectFile, InstantiatedCommand, WomFileMapper}
 
@@ -72,7 +74,8 @@ case class DefaultStandardAsyncExecutionActorParams
   * NOTE: Unlike the parent trait `AsyncBackendJobExecutionActor`, this trait is subject to even more frequent updates
   * as the common behavior among the backends adjusts in unison.
   */
-trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with StandardCachingActorHelper with AsyncIoActorClient with KvClient {
+trait StandardAsyncExecutionActor
+  extends AsyncBackendJobExecutionActor with StandardCachingActorHelper with AsyncIoActorClient with KvClient with SlowJobWarning {
   this: Actor with ActorLogging with BackendJobLifecycleActor =>
 
   override lazy val ioCommandBuilder: IoCommandBuilder = DefaultIoCommandBuilder
@@ -168,6 +171,9 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
 
   lazy val jobShell: String = configurationDescriptor.backendConfig.getOrElse("job-shell",
     configurationDescriptor.globalConfig.getOrElse("system.job-shell", "/bin/bash"))
+
+  lazy val abbreviateCommandLength: Int = configurationDescriptor.backendConfig.getOrElse("abbreviate-command-length",
+    configurationDescriptor.globalConfig.getOrElse("system.abbreviate-command-length", 0))
 
   /**
     * The local path where the command will run.
@@ -310,8 +316,10 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
 
   /** A bash script containing the custom preamble, the instantiated command, and output globbing behavior. */
   def commandScriptContents: ErrorOr[String] = {
-    jobLogger.info(s"`${instantiatedCommand.commandString}`")
-    tellMetadata(Map(CallMetadataKeys.CommandLine -> instantiatedCommand.commandString))
+    val commandString = instantiatedCommand.commandString
+    val commandStringAbbreviated = StringUtils.abbreviateMiddle(commandString, "...", abbreviateCommandLength)
+    jobLogger.info(s"`$commandStringAbbreviated`")
+    tellMetadata(Map(CallMetadataKeys.CommandLine -> commandStringAbbreviated))
 
     val cwd = commandDirectory
     val rcPath = cwd./(jobPaths.returnCodeFilename)
@@ -350,7 +358,7 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
         s"""(
            |# add a .file in every empty directory to facilitate directory delocalization on the cloud
            |cd $cwd
-           |find . -type d -empty -print0 | xargs -0 -I % touch %/.file
+           |find . -type d -exec sh -c '[ -z "$$(ls -A '"'"'{}'"'"')" ] && touch '"'"'{}'"'"'/.file' \\;
            |)""".stripMargin)
 
     // The `tee` trickery below is to be able to redirect to known filenames for CWL while also streaming
@@ -359,14 +367,14 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
     (errorOrDirectoryOutputs, errorOrGlobFiles).mapN((directoryOutputs, globFiles) =>
     s"""|#!$jobShell
         |DOCKER_OUTPUT_DIR_LINK
-        |cd $cwd
+        |cd ${cwd.pathAsString}
         |tmpDir=$temporaryDirectory
         |$tmpDirPermissionsAdjustment
         |export _JAVA_OPTIONS=-Djava.io.tmpdir="$$tmpDir"
         |export TMPDIR="$$tmpDir"
         |export HOME="$home"
         |(
-        |cd $cwd
+        |cd ${cwd.pathAsString}
         |SCRIPT_PREAMBLE
         |)
         |$out="$${tmpDir}/out.$$$$" $err="$${tmpDir}/err.$$$$"
@@ -375,14 +383,14 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
         |tee $stdoutRedirection < "$$$out" &
         |tee $stderrRedirection < "$$$err" >&2 &
         |(
-        |cd $cwd
+        |cd ${cwd.pathAsString}
         |ENVIRONMENT_VARIABLES
         |INSTANTIATED_COMMAND
         |) $stdinRedirection > "$$$out" 2> "$$$err"
         |echo $$? > $rcTmpPath
         |$emptyDirectoryFillCommand
         |(
-        |cd $cwd
+        |cd ${cwd.pathAsString}
         |SCRIPT_EPILOGUE
         |${globScripts(globFiles)}
         |${directoryScripts(directoryOutputs)}
@@ -391,7 +399,7 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
         |""".stripMargin
       .replace("SCRIPT_PREAMBLE", scriptPreamble)
       .replace("ENVIRONMENT_VARIABLES", environmentVariables)
-      .replace("INSTANTIATED_COMMAND", instantiatedCommand.commandString)
+      .replace("INSTANTIATED_COMMAND", commandString)
       .replace("SCRIPT_EPILOGUE", scriptEpilogue)
       .replace("DOCKER_OUTPUT_DIR_LINK", dockerOutputDir))
   }
@@ -475,10 +483,13 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
 
     val evaluateAndInitialize = (containerizedInputExpression: ContainerizedInputExpression) => for {
       mapped <- mappedInputs
-      evaluated <- containerizedInputExpression.evaluate(unmappedInputs, mapped, backendEngineFunctions).toEither
-      initialized <- evaluated.traverse[ErrorOr, AdHocValue]({ adHocValue =>
-        adHocValue.womValue.initializeWomFile(backendEngineFunctions).map(i => adHocValue.copy(womValue = i))
-      }).toEither
+      evaluated <- containerizedInputExpression.evaluate(unmappedInputs, mapped, backendEngineFunctions).toChecked
+      initialized <- evaluated.traverse[IOChecked, AdHocValue]({ adHocValue =>
+        adHocValue.womValue.initialize(backendEngineFunctions).map({
+          case file: WomFile => adHocValue.copy(womValue = file)
+          case _ => adHocValue
+        })
+      }).toChecked
     } yield initialized
 
     callable.adHocFileCreation.toList
@@ -616,7 +627,7 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
     * @return the execution handle for the job.
     */
   def execute(): ExecutionHandle = {
-    throw new NotImplementedError(s"Neither execute() nor executeAsync() implemented by $getClass")
+    throw new UnsupportedOperationException(s"Neither execute() nor executeAsync() implemented by $getClass")
   }
 
   /**
@@ -676,7 +687,7 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
     * @return The status of the job.
     */
   def pollStatus(handle: StandardAsyncPendingExecutionHandle): StandardAsyncRunState = {
-    throw new NotImplementedError(s"Neither pollStatus nor pollStatusAsync implemented by $getClass")
+    throw new UnsupportedOperationException(s"Neither pollStatus nor pollStatusAsync implemented by $getClass")
   }
 
   /**
@@ -913,7 +924,7 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
   private var missedAbort = false
   private case class CheckMissedAbort(jobId: StandardAsyncJob)
 
-  context.become(kvClientReceive orElse standardReceiveBehavior(None) orElse receive)
+  context.become(kvClientReceive orElse standardReceiveBehavior(None) orElse slowJobWarningReceive orElse receive)
 
   def standardReceiveBehavior(jobIdOption: Option[StandardAsyncJob]): Receive = LoggingReceive {
     case AbortJobCommand =>
@@ -955,6 +966,9 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
   private def executeOrRecoverSuccess(executionHandle: ExecutionHandle): Future[ExecutionHandle] = {
     executionHandle match {
       case handle: PendingExecutionHandle[StandardAsyncJob@unchecked, StandardAsyncRunInfo@unchecked, StandardAsyncRunState@unchecked] =>
+
+        configurationDescriptor.slowJobWarningAfter foreach { duration => self ! WarnAboutSlownessAfter(handle.pendingJob.jobId, duration) }
+
         tellKvJobId(handle.pendingJob) map { _ =>
           jobLogger.info(s"job id: ${handle.pendingJob.jobId}")
           tellMetadata(Map(CallMetadataKeys.JobId -> handle.pendingJob.jobId))
@@ -979,6 +993,7 @@ trait StandardAsyncExecutionActor extends AsyncBackendJobExecutionActor with Sta
         jobLogger.debug(s"$tag Polling Job ${handle.pendingJob}")
         pollStatusAsync(handle) flatMap {
           backendRunStatus =>
+            self ! WarnAboutSlownessIfNecessary
             handlePollSuccess(handle, backendRunStatus)
         } recover {
           case throwable =>

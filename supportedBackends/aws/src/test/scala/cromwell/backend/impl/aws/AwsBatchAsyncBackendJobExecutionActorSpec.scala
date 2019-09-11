@@ -59,8 +59,8 @@ import cromwell.util.SampleWdl
 import org.scalatest._
 import org.slf4j.Logger
 import org.specs2.mock.Mockito
-import software.amazon.awssdk.core.auth.AnonymousCredentialsProvider
-import software.amazon.awssdk.core.regions.Region
+import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider
+import software.amazon.awssdk.regions.Region
 import spray.json._
 import wdl.draft2.model._
 import wdl.transforms.draft2.wdlom2wom.WdlDraft2WomExecutableMakers._
@@ -80,8 +80,12 @@ import scala.util.Success
 
 class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAsyncBackendJobExecutionActorSpec")
   with FlatSpecLike with Matchers with ImplicitSender with Mockito with BackendSpec with BeforeAndAfter with DefaultJsonProtocol {
-  lazy val mockPathBuilder: S3PathBuilder = S3PathBuilder.fromCredentials(AnonymousCredentialsProvider.create.getCredentials,
-    S3Storage.DefaultConfiguration, WorkflowOptions.empty, Option(Region.US_EAST_1))
+  lazy val mockPathBuilder: S3PathBuilder = S3PathBuilder.fromCredentials(
+    AnonymousCredentialsProvider.create.resolveCredentials(),
+    S3Storage.DefaultConfiguration,
+    WorkflowOptions.empty,
+    Option(Region.US_EAST_1)
+  )
 
   var kvService: ActorRef = system.actorOf(Props(new InMemoryKvServiceActor))
 
@@ -129,7 +133,11 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
   }
 
   private def buildInitializationData(jobDescriptor: BackendJobDescriptor, configuration: AwsBatchConfiguration) = {
-    val workflowPaths = AwsBatchWorkflowPaths(jobDescriptor.workflowDescriptor, AnonymousCredentialsProvider.create.getCredentials, configuration)(system)
+    val workflowPaths = AwsBatchWorkflowPaths(
+      jobDescriptor.workflowDescriptor,
+      AnonymousCredentialsProvider.create.resolveCredentials(),
+      configuration
+    )
     val runtimeAttributesBuilder = AwsBatchRuntimeAttributes.runtimeAttributesBuilder(configuration)
     AwsBatchBackendInitializationData(workflowPaths, runtimeAttributesBuilder, configuration, null)
   }
@@ -205,14 +213,17 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
           womDefinition,
           inputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val job = workflowDescriptor.callable.taskCallNodes.head
         val key = BackendJobDescriptorKey(job, None, attempt)
         val runtimeAttributes = makeRuntimeAttributes(job)
         val prefetchedKvEntries = Map[String, KvResponse]()
-        BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(Inputs), NoDocker, prefetchedKvEntries)
+        BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(Inputs), NoDocker, None, prefetchedKvEntries)
       case Left(badtimes) => fail(badtimes.toList.mkString(", "))
     }
   }
@@ -431,13 +442,16 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val call: CommandCallNode = workflowDescriptor.callable.graph.nodes.collectFirst({ case t: CommandCallNode => t }).get
         val key = BackendJobDescriptorKey(call, None, 1)
         val runtimeAttributes = makeRuntimeAttributes(call)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestableAwsBatchJobExecutionActor(jobDescriptor, Promise(), configuration))
         val testActorRef = TestActorRef[TestableAwsBatchJobExecutionActor](
@@ -504,13 +518,16 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val job: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
         val runtimeAttributes = makeRuntimeAttributes(job)
         val key = BackendJobDescriptorKey(job, None, 1)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestableAwsBatchJobExecutionActor(jobDescriptor, Promise(), configuration))
         val testActorRef = TestActorRef[TestableAwsBatchJobExecutionActor](
@@ -552,13 +569,16 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.find(_.localName == callName).get
         val key = BackendJobDescriptorKey(call, None, 1)
         val runtimeAttributes = makeRuntimeAttributes(call)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestableAwsBatchJobExecutionActor(jobDescriptor, Promise(), configuration, functions))
         TestActorRef[TestableAwsBatchJobExecutionActor](props, s"TestableAwsBatchJobExecutionActor-${jobDescriptor.workflowDescriptor.id}")
@@ -619,13 +639,16 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val job: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
         val runtimeAttributes = makeRuntimeAttributes(job)
         val key = BackendJobDescriptorKey(job, None, 1)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestableAwsBatchJobExecutionActor(jobDescriptor, Promise(), configuration))
         val testActorRef = TestActorRef[TestableAwsBatchJobExecutionActor](
@@ -654,13 +677,16 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
           womWorkflow,
           wdlInputs,
           NoOptions,
-          Labels.empty
+          Labels.empty,
+          HogGroup("foo"),
+          List.empty,
+          None
         )
 
         val job: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
         val runtimeAttributes = makeRuntimeAttributes(job)
         val key = BackendJobDescriptorKey(job, None, 1)
-        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, Map.empty)
+        val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, fqnWdlMapToDeclarationMap(inputs), NoDocker, None, Map.empty)
 
         val props = Props(new TestableAwsBatchJobExecutionActor(jobDescriptor, Promise(), configuration))
         val testActorRef = TestActorRef[TestableAwsBatchJobExecutionActor](
@@ -703,13 +729,16 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
         Seq.empty[Draft2ImportResolver]).get.workflow.toWomWorkflowDefinition(isASubworkflow = false).getOrElse(fail("failed to get WomDefinition from WdlWorkflow")),
       Map.empty,
       NoOptions,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.head
     val key = BackendJobDescriptorKey(call, None, 1)
     val runtimeAttributes = makeRuntimeAttributes(call)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestableAwsBatchJobExecutionActor(jobDescriptor, Promise(), configuration))
     val testActorRef = TestActorRef[TestableAwsBatchJobExecutionActor](
@@ -738,13 +767,16 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
         Seq.empty[Draft2ImportResolver]).get.workflow.toWomWorkflowDefinition(isASubworkflow = false).getOrElse(fail("failed to get WomDefinition from WdlWorkflow")),
       Map.empty,
       WorkflowOptions.fromJsonString(""" {"aws_s3_root": "s3://path/to/root"} """).get,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.find(_.localName == "hello").get
     val key = BackendJobDescriptorKey(call, None, 1)
     val runtimeAttributes = makeRuntimeAttributes(call)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestableAwsBatchJobExecutionActor(jobDescriptor, Promise(), configuration))
     val testActorRef = TestActorRef[TestableAwsBatchJobExecutionActor](
@@ -758,9 +790,6 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
     backend.callPaths.stderr should be(a[S3Path])
     backend.callPaths.stderr.pathAsString shouldBe
       "s3://path/to/root/wf_hello/e6236763-c518-41d0-9688-432549a8bf7c/call-hello/hello-stderr.log"
-    backend.callPaths.logPath should be(a[S3Path])
-    backend.callPaths.logPath.pathAsString shouldBe
-      "s3://path/to/root/wf_hello/e6236763-c518-41d0-9688-432549a8bf7c/call-hello/hello.log"
   }
 
   it should "return log paths for scattered call" taggedAs AwsTest ignore {
@@ -771,13 +800,16 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
         Seq.empty[Draft2ImportResolver]).get.workflow.toWomWorkflowDefinition(isASubworkflow = false).getOrElse(fail("failed to get WomDefinition from WdlWorkflow")),
       Map.empty,
       WorkflowOptions.fromJsonString(""" {"root": "s3://path/to/root"} """).get,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
 
     val call: CommandCallNode = workflowDescriptor.callable.taskCallNodes.find(_.localName == "B").get
     val key = BackendJobDescriptorKey(call, Option(2), 1)
     val runtimeAttributes = makeRuntimeAttributes(call)
-    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, Map.empty)
+    val jobDescriptor = BackendJobDescriptor(workflowDescriptor, key, runtimeAttributes, Map.empty, NoDocker, None, Map.empty)
 
     val props = Props(new TestableAwsBatchJobExecutionActor(jobDescriptor, Promise(), configuration))
     val testActorRef = TestActorRef[TestableAwsBatchJobExecutionActor](
@@ -791,9 +823,6 @@ class AwsBatchAsyncBackendJobExecutionActorSpec extends TestKitSuite("AwsBatchAs
     backend.callPaths.stderr should be(a[S3Path])
     backend.callPaths.stderr.pathAsString shouldBe
       "s3://path/to/root/w/e6236763-c518-41d0-9688-432549a8bf7d/call-B/shard-2/B-2-stderr.log"
-    backend.callPaths.logPath should be(a[S3Path])
-    backend.callPaths.logPath.pathAsString shouldBe
-      "s3://path/to/root/w/e6236763-c518-41d0-9688-432549a8bf7d/call-B/shard-2/B-2.log"
   }
 
   private def makeRuntimeAttributes(job: CommandCallNode) = {

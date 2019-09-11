@@ -14,8 +14,7 @@ import wdl.model.draft3.elements.CommandPartElement.{PlaceholderCommandPartEleme
 import wdl.model.draft3.elements.ExpressionElement.ExpressionLiteralElement
 import wom.callable.Callable._
 import wom.callable.Callable.OutputDefinition
-import wom.callable.{CallableTaskDefinition, WorkflowDefinition}
-import wom.callable.MetaValueElement.MetaValueElementString
+import wom.callable.{CallableTaskDefinition, MetaValueElement, WorkflowDefinition}
 import wom.executable.WomBundle
 import wom.expression.WomExpression
 import wom.graph._
@@ -65,22 +64,18 @@ object WomToWdlom {
       }
     }
 
-  def mapToMetaSectionElement: CheckedAtoB[Map[String, String], Option[MetaSectionElement]] =
-    CheckedAtoB.fromCheck { a: Map[String, String] =>
+  def mapToMetaSectionElement: CheckedAtoB[Map[String, MetaValueElement], Option[MetaSectionElement]] =
+    CheckedAtoB.fromCheck { a: Map[String, MetaValueElement] =>
       if (a.nonEmpty)
-        Some(MetaSectionElement(a map { case (key, value) =>
-          key -> MetaValueElementString(value) // draft-2: strings only
-        })).validNelCheck
+        Some(MetaSectionElement(a)).validNelCheck
       else
         None.validNelCheck
     }
 
-  def mapToParameterMetaSectionElement: CheckedAtoB[Map[String, String], Option[ParameterMetaSectionElement]] =
-    CheckedAtoB.fromCheck { a: Map[String, String] =>
+  def mapToParameterMetaSectionElement: CheckedAtoB[Map[String, MetaValueElement], Option[ParameterMetaSectionElement]] =
+    CheckedAtoB.fromCheck { a: Map[String, MetaValueElement] =>
       if (a.nonEmpty)
-        Some(ParameterMetaSectionElement(a map { case (key, value) =>
-          key -> MetaValueElementString(value) // draft-2: strings only
-        })).validNelCheck
+        Some(ParameterMetaSectionElement(a)).validNelCheck
       else
         None.validNelCheck
     }
@@ -121,11 +116,11 @@ object WomToWdlom {
         a match {
           case a: RequiredInputDefinition =>
             InputDeclarationElement(womType, a.localName.value, None).validNelCheck
-          case a: InputDefinitionWithDefault =>
+          case a: OverridableInputDefinitionWithDefault =>
             womExpressionToExpressionElement(a.default) map { expression =>
               InputDeclarationElement(womType, a.localName.value, Some(expression))
             }
-          case a: FixedInputDefinition =>
+          case a: FixedInputDefinitionWithDefault =>
             womExpressionToExpressionElement(a.default) map { expression =>
               InputDeclarationElement(womType, a.localName.value, Some(expression))
             }
@@ -173,7 +168,8 @@ object WomToWdlom {
             CommandSectionElement(Seq(commandLine)),
             runtime,
             meta,
-            parameterMeta
+            parameterMeta,
+            a.sourceLocation
           )
         }
       }
@@ -201,7 +197,8 @@ object WomToWdlom {
             nodes.toSet,
             if (outputs.nonEmpty) Some(OutputsSectionElement(outputs)) else None,
             meta,
-            parameterMeta)
+            parameterMeta,
+            a.sourceLocation)
         }
       }
 
@@ -265,7 +262,8 @@ object WomToWdlom {
               scatterName = a.identifier.localName.value,
               scatterExpression = expression,
               scatterVariableName = a.inputPorts.toList.head.name,
-              graphElements = graph
+              graphElements = graph,
+              sourceLocation = None
             )
           }
       }
@@ -390,10 +388,14 @@ object WomToWdlom {
       else
         None
 
+      val afters = call.nonInputBasedPrerequisites.map(_.localName).toVector
+
       CallElement(
         callableName,
         maybeAlias,
-        if (inputs.nonEmpty) Some(CallBodyElement(inputs)) else None
+        afters,
+        if (inputs.nonEmpty) Some(CallBodyElement(inputs)) else None,
+        call.sourceLocation
       ).validNelCheck
     }
 }

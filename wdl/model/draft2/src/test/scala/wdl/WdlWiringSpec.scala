@@ -3,7 +3,9 @@ package wdl
 import better.files._
 import org.scalatest.{FlatSpec, Matchers}
 import spray.json._
+import wdl.draft2.Draft2ResolvedImportBundle
 import wdl.draft2.model._
+import wom.ResolvedImportRecord
 
 import scala.collection.immutable.ListMap
 
@@ -14,7 +16,8 @@ class WdlWiringSpec extends FlatSpec with Matchers {
   testCases.list.toSeq.filter(_.isDirectory) foreach { testDir =>
     val wdlFile = testDir / "test.wdl"
     if (!wdlFile.exists) fail(s"Expecting a 'test.wdl' file in directory 'cases/${testDir.name}'")
-    def resolvers: Seq[Draft2ImportResolver] = Seq((relPath: String) => (testDir / relPath).contentAsString)
+    def resolvers: Seq[Draft2ImportResolver] =
+      Seq((relPath: String) => Draft2ResolvedImportBundle((testDir / relPath).contentAsString, ResolvedImportRecord((testDir / relPath).pathAsString)))
     val namespace = WdlNamespaceWithWorkflow.load(File(wdlFile.path).contentAsString, resolvers).get
     val wdlFileRelPath = File(".").relativize(wdlFile)
 
@@ -30,7 +33,7 @@ class WdlWiringSpec extends FlatSpec with Matchers {
       it should s"have $fqn (of type $womType) as an input in WDL file $wdlFileRelPath" in {
         val input = namespace.workflow.inputs.get(fqn)
         input should not be None
-        input.map(_.womType.toDisplayString) shouldEqual Option(womType)
+        input.map(_.womType.stableName) shouldEqual Option(womType)
       }
     }
 
@@ -87,7 +90,7 @@ class WdlWiringSpec extends FlatSpec with Matchers {
 
     if (!expectedWorkflowInputsFile.exists) {
       val workflowInputs = namespace.workflow.inputs map { case (fqn, input) =>
-        fqn -> JsString(input.womType.toDisplayString)
+        fqn -> JsString(input.womType.stableName)
       }
       val jsObject = JsObject(ListMap(workflowInputs.toSeq.sortBy(_._1): _*))
       expectedWorkflowInputsFile.write(jsObject.prettyPrint + "\n")

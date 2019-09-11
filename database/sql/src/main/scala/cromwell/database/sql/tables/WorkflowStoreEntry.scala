@@ -1,34 +1,25 @@
 package cromwell.database.sql.tables
 
-import java.sql.{Blob, Clob, Timestamp}
+import java.sql.Timestamp
 
-import cromwell.database.sql.tables.WorkflowStoreEntry.WorkflowStoreState.WorkflowStoreState
-
-object WorkflowStoreEntry {
-  object WorkflowStoreState extends Enumeration {
-    type WorkflowStoreState = Value
-    val Submitted = Value("Submitted")
-    val Running = Value("Running")
-    val Aborting = Value("Aborting")
-    val OnHold = Value("On Hold")
-  }
-}
+import javax.sql.rowset.serial.{SerialBlob, SerialClob}
 
 case class WorkflowStoreEntry
 (
   workflowExecutionUuid: String,
-  workflowDefinition: Option[Clob],
+  workflowDefinition: Option[SerialClob],
   workflowUrl: Option[String],
   workflowRoot: Option[String],
   workflowType: Option[String],
   workflowTypeVersion: Option[String],
-  workflowInputs: Option[Clob],
-  workflowOptions: Option[Clob],
-  workflowState: WorkflowStoreState,
+  workflowInputs: Option[SerialClob],
+  workflowOptions: Option[SerialClob],
+  workflowState: String,
   submissionTime: Timestamp,
-  importsZip: Option[Blob],
-  customLabels: Clob,
+  importsZip: Option[SerialBlob],
+  customLabels: SerialClob,
   cromwellId: Option[String],
   heartbeatTimestamp: Option[Timestamp],
+  hogGroup: Option[String],
   workflowStoreEntryId: Option[Int] = None
 )

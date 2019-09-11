@@ -15,17 +15,37 @@ cromwell::build::assemble_jars
 
 
 # Installing the AWS CLI
-pip install awscli --upgrade --user
+cromwell::build::pip_install awscli --upgrade
 export AWS_SHARED_CREDENTIALS_FILE="${CROMWELL_BUILD_RESOURCES_DIRECTORY}"/aws_credentials
 export AWS_CONFIG_FILE="${CROMWELL_BUILD_RESOURCES_DIRECTORY}"/aws_config
 
-# The following tests are skipped:
-#
-# -i singlesample.aws \
-#   Fails as of 2018-09-25 due to an over-eager .stripMargin
 
 cromwell::build::run_centaur \
-    -i hello \
-    -i haplotypcaller.aws
+    -p 100 \
+    -e smartseq2singlesample \
+    -e arrays \
+    -e haplotypecaller \
+    -e jointdiscovery \
+    -e mutect2 \
+    -e singlesample \
+    -e singlesample_production \
+    -e cnv_somatic_pair \
+    -e cnv_somatic_panel \
+    -e localdockertest \
+    -e inline_file \
+    -e iwdr_input_string_function \
+    -e non_root_default_user \
+    -e cwl_interpolated_strings \
+    -e non_root_specified_user \
+    -e space \
+    -e draft3_optional_input_from_scatter \
+    -e iwdr_input_string \
+    -e cwl_cache_between_workflows \
+    -e abort.scheduled_abort \
+    -e cwl_cache_within_workflow \
+    -e inline_file_custom_entryname \
+    -e relative_output_paths \
+    -e relative_output_paths_colliding \
+    -e standard_output_paths_colliding_prevented \
 
 cromwell::build::generate_code_coverage

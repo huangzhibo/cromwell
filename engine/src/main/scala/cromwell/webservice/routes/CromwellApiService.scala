@@ -3,41 +3,46 @@ package cromwell.webservice.routes
 import java.util.UUID
 
 import akka.actor.{ActorRef, ActorRefFactory}
+import cromwell.engine.workflow.lifecycle.execution.callcaching.CallCacheDiffActorJsonFormatting.successfulResponseJsonFormatter
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import akka.http.scaladsl.marshalling.{ToEntityMarshaller, ToResponseMarshallable}
+import akka.http.scaladsl.marshalling.ToResponseMarshallable
 import akka.http.scaladsl.model._
-import akka.http.scaladsl.model.headers.RawHeader
+import akka.http.scaladsl.model.ContentTypes._
 import akka.http.scaladsl.server.Directives._
-import akka.http.scaladsl.server.Route
+import akka.http.scaladsl.server.{ExceptionHandler, Route}
 import akka.pattern.{AskTimeoutException, ask}
 import akka.stream.ActorMaterializer
-import akka.util.{ByteString, Timeout}
+import akka.util.Timeout
 import cats.data.NonEmptyList
 import cats.data.Validated.{Invalid, Valid}
 import com.typesafe.config.ConfigFactory
 import common.exception.AggregatedMessageException
 import common.util.VersionUtil
-import cromwell.core.abort.{AbortResponse, WorkflowAbortFailureResponse, WorkflowAbortingResponse}
+import cromwell.core.abort._
 import cromwell.core.{path => _, _}
-import cromwell.database.slick.WorkflowStoreSlickDatabase.NotInOnHoldStateException
 import cromwell.engine.backend.BackendConfiguration
 import cromwell.engine.instrumentation.HttpInstrumentation
-import cromwell.engine.workflow.WorkflowManagerActor.{AbortWorkflowCommand, WorkflowNotFoundException}
-import cromwell.engine.workflow.lifecycle.execution.callcaching.CallCacheDiffActor.{BuiltCallCacheDiffResponse, CachedCallNotFoundException, CallCacheDiffActorResponse, FailedCallCacheDiffResponse}
+import cromwell.engine.workflow.WorkflowManagerActor.WorkflowNotFoundException
+import cromwell.engine.workflow.lifecycle.execution.callcaching.CallCacheDiffActor.{CachedCallNotFoundException, CallCacheDiffActorResponse, FailedCallCacheDiffResponse, SuccessfulCallCacheDiffResponse}
 import cromwell.engine.workflow.lifecycle.execution.callcaching.{CallCacheDiffActor, CallCacheDiffQueryParameter}
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.NotInOnHoldStateException
 import cromwell.engine.workflow.workflowstore.{WorkflowStoreActor, WorkflowStoreEngineActor, WorkflowStoreSubmitActor}
 import cromwell.server.CromwellShutdown
-import cromwell.services.healthmonitor.HealthMonitorServiceActor.{GetCurrentStatus, StatusCheckResponse}
+import cromwell.services.healthmonitor.ProtoHealthMonitorServiceActor.{GetCurrentStatus, StatusCheckResponse}
 import cromwell.services.metadata.MetadataService._
 import cromwell.webservice._
+import cromwell.services.metadata.impl.builder.MetadataBuilderActor.{BuiltMetadataResponse, FailedMetadataResponse, MetadataBuilderActorResponse}
 import cromwell.webservice.WorkflowJsonSupport._
+import cromwell.webservice.WebServiceUtils
+import cromwell.webservice.WebServiceUtils.EnhancedThrowable
 import net.ceedubs.ficus.Ficus._
 
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future, TimeoutException}
+import scala.io.Source
 import scala.util.{Failure, Success, Try}
 
-trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport {
+trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport with WomtoolRouteSupport with WebServiceUtils {
   import CromwellApiService._
 
   implicit def actorRefFactory: ActorRefFactory
@@ -84,7 +89,7 @@ trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport {
               case Valid(queryParameter) =>
                 val diffActor = actorRefFactory.actorOf(CallCacheDiffActor.props(serviceRegistryActor), "CallCacheDiffActor-" + UUID.randomUUID())
                 onComplete(diffActor.ask(queryParameter).mapTo[CallCacheDiffActorResponse]) {
-                  case Success(r: BuiltCallCacheDiffResponse) => complete(r.response)
+                  case Success(r: SuccessfulCallCacheDiffResponse) => complete(r)
                   case Success(r: FailedCallCacheDiffResponse) => r.reason.errorRequest(StatusCodes.InternalServerError)
                   case Failure(_: AskTimeoutException) if CromwellShutdown.shutdownInProgress() => serviceShuttingDownResponse
                   case Failure(e: CachedCallNotFoundException) => e.errorRequest(StatusCodes.NotFound)
@@ -101,8 +106,10 @@ trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport {
     } ~
     path("workflows" / Segment / Segment / "timing") { (_, possibleWorkflowId) =>
       instrumentRequest {
-        onComplete(validateWorkflowId(possibleWorkflowId, serviceRegistryActor)) {
-          case Success(_) => getFromResource("workflowTimings/workflowTimings.html")
+        onComplete(validateWorkflowIdInMetadata(possibleWorkflowId, serviceRegistryActor)) {
+          case Success(workflowId) => completeTimingRouteResponse(metadataLookupForTimingRoute(workflowId))
+          case Failure(e: UnrecognizedWorkflowException) => e.failRequest(StatusCodes.NotFound)
+          case Failure(e: InvalidWorkflowException) => e.failRequest(StatusCodes.BadRequest)
           case Failure(e) => e.failRequest(StatusCodes.InternalServerError)
         }
       }
@@ -110,31 +117,7 @@ trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport {
     path("workflows" / Segment / Segment / "abort") { (_, possibleWorkflowId) =>
       post {
         instrumentRequest {
-          def sendAbort(workflowId: WorkflowId): Route = {
-            val response = workflowStoreActor.ask(WorkflowStoreActor.AbortWorkflowCommand(workflowId)).mapTo[AbortResponse]
-
-            onComplete(response) {
-              case Success(WorkflowAbortingResponse(id, restarted)) =>
-                workflowManagerActor ! AbortWorkflowCommand(id, restarted)
-                complete(ToResponseMarshallable(WorkflowAbortResponse(id.toString, WorkflowAborting.toString)))
-              case Success(WorkflowAbortFailureResponse(_, e: IllegalStateException)) =>
-                /*
-                  Note that this is currently impossible to reach but was left as-is during the transition to akka http.
-                  When aborts get fixed, this should be looked at.
-                */
-                e.errorRequest(StatusCodes.Forbidden)
-              case Success(WorkflowAbortFailureResponse(_, e: WorkflowNotFoundException)) => e.errorRequest(StatusCodes.NotFound)
-              case Success(WorkflowAbortFailureResponse(_, e)) => e.errorRequest(StatusCodes.InternalServerError)
-              case Failure(_: AskTimeoutException) if CromwellShutdown.shutdownInProgress() => serviceShuttingDownResponse
-              case Failure(e: TimeoutException) => e.failRequest(StatusCodes.ServiceUnavailable)
-              case Failure(e) => e.errorRequest(StatusCodes.InternalServerError)
-            }
-          }
-
-          Try(WorkflowId.fromString(possibleWorkflowId)) match {
-            case Success(workflowId) => sendAbort(workflowId)
-            case Failure(_) => InvalidWorkflowException(possibleWorkflowId).failRequest(StatusCodes.BadRequest)
-          }
+          abortWorkflow(possibleWorkflowId, workflowStoreActor, workflowManagerActor)
         }
       }
     } ~
@@ -159,7 +142,7 @@ trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport {
   path("workflows" / Segment / Segment / "releaseHold") { (_, possibleWorkflowId) =>
     post {
       instrumentRequest {
-        val response = validateWorkflowId(possibleWorkflowId, serviceRegistryActor) flatMap { workflowId =>
+        val response = validateWorkflowIdInMetadata(possibleWorkflowId, serviceRegistryActor) flatMap { workflowId =>
           workflowStoreActor.ask(WorkflowStoreActor.WorkflowOnHoldToSubmittedCommand(workflowId)).mapTo[WorkflowStoreEngineActor.WorkflowOnHoldToSubmittedResponse]
         }
         onComplete(response){
@@ -174,14 +157,36 @@ trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport {
     }
   } ~ metadataRoutes
 
+
+  private def metadataLookupForTimingRoute(workflowId: WorkflowId): Future[MetadataBuilderActorResponse] = {
+    val includeKeys = NonEmptyList.of("start", "end", "executionStatus", "executionEvents", "subWorkflowMetadata")
+    val readMetadataRequest = (w: WorkflowId) => GetSingleWorkflowMetadataAction(w, Option(includeKeys), None, expandSubWorkflows = true)
+
+    serviceRegistryActor.ask(readMetadataRequest(workflowId)).mapTo[MetadataBuilderActorResponse]
+  }
+
+  private def completeTimingRouteResponse(metadataResponse: Future[MetadataBuilderActorResponse]) = {
+    onComplete(metadataResponse) {
+      case Success(r: BuiltMetadataResponse) =>
+
+        Try(Source.fromResource("workflowTimings/workflowTimings.html").mkString) match {
+          case Success(wfTimingsContent) =>
+            val response = HttpResponse(entity = wfTimingsContent.replace("\"{{REPLACE_THIS_WITH_METADATA}}\"", r.responseJson.toString))
+            complete(response.withEntity(response.entity.withContentType(`text/html(UTF-8)`)))
+          case Failure(e) => completeResponse(StatusCodes.InternalServerError, APIResponse.fail(new RuntimeException("Error while loading workflowTimings.html", e)), Seq.empty)
+        }
+      case Success(r: FailedMetadataResponse) => r.reason.errorRequest(StatusCodes.InternalServerError)
+      case Failure(_: AskTimeoutException) if CromwellShutdown.shutdownInProgress() => serviceShuttingDownResponse
+      case Failure(e: TimeoutException) => e.failRequest(StatusCodes.ServiceUnavailable)
+      case Failure(e) => e.failRequest(StatusCodes.InternalServerError)
+    }
+  }
+
   private def toResponse(workflowId: WorkflowId, workflowState: WorkflowState): WorkflowSubmitResponse = {
     WorkflowSubmitResponse(workflowId.toString, workflowState.toString)
   }
 
   private def submitRequest(formData: Multipart.FormData, isSingleSubmission: Boolean): Route = {
-    val allParts: Future[Map[String, ByteString]] = formData.parts.mapAsync[(String, ByteString)](1) {
-      bodyPart => bodyPart.toStrict(duration).map(strict => bodyPart.name -> strict.entity.data)
-    }.runFold(Map.empty[String, ByteString])((map, tuple) => map + tuple)
 
     def getWorkflowState(workflowOnHold: Boolean): WorkflowState = {
       if (workflowOnHold)
@@ -207,7 +212,7 @@ trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport {
       }
     }
 
-    onComplete(allParts) {
+    onComplete(materializeFormData(formData)) {
       case Success(data) =>
         PartialWorkflowSources.fromSubmitRoute(data, allowNoInputs = isSingleSubmission) match {
           case Success(workflowSourceFiles) if isSingleSubmission && workflowSourceFiles.size == 1 =>
@@ -234,21 +239,56 @@ trait CromwellApiService extends HttpInstrumentation with MetadataRouteSupport {
 object CromwellApiService {
   import spray.json._
 
-  implicit class EnhancedThrowable(val e: Throwable) extends AnyVal {
-    def failRequest(statusCode: StatusCode, warnings: Seq[String] = Vector.empty): Route = {
-      completeResponse(statusCode, APIResponse.fail(e).toJson.prettyPrint, warnings)
-    }
-    def errorRequest(statusCode: StatusCode, warnings: Seq[String] = Vector.empty): Route = {
-      completeResponse(statusCode, APIResponse.error(e).toJson.prettyPrint, warnings)
+  /**
+    * Sends a request to abort the workflow. Provides configurable success & error handlers to allow
+    * for different API endpoints to provide different effects in the appropriate situations, e.g. HTTP codes
+    * and error messages
+    */
+  def abortWorkflow(possibleWorkflowId: String,
+                    workflowStoreActor: ActorRef,
+                    workflowManagerActor: ActorRef,
+                    successHandler: PartialFunction[SuccessfulAbortResponse, Route] = standardAbortSuccessHandler,
+                    errorHandler: PartialFunction[Throwable, Route] = standardAbortErrorHandler)
+                   (implicit timeout: Timeout): Route = {
+    handleExceptions(ExceptionHandler(errorHandler)) {
+      Try(WorkflowId.fromString(possibleWorkflowId)) match {
+        case Success(workflowId) =>
+          val response = workflowStoreActor.ask(WorkflowStoreActor.AbortWorkflowCommand(workflowId)).mapTo[AbortResponse]
+          onComplete(response) {
+            case Success(x: SuccessfulAbortResponse) => successHandler(x)
+            case Success(x: WorkflowAbortFailureResponse) => throw x.failure
+            case Failure(e) => throw e
+          }
+        case Failure(_) => throw InvalidWorkflowException(possibleWorkflowId)
+      }
     }
   }
 
-  def validateWorkflowId(possibleWorkflowId: String,
-                         serviceRegistryActor: ActorRef)
-                        (implicit timeout: Timeout, executor: ExecutionContext): Future[WorkflowId] = {
+  /**
+    * The abort success handler for typical cases, i.e. cromwell's API.
+    */
+  private def standardAbortSuccessHandler: PartialFunction[SuccessfulAbortResponse, Route] = {
+    case WorkflowAbortedResponse(id) => complete(ToResponseMarshallable(WorkflowAbortResponse(id.toString, WorkflowAborted.toString)))
+    case WorkflowAbortRequestedResponse(id) => complete(ToResponseMarshallable(WorkflowAbortResponse(id.toString, WorkflowAborting.toString)))
+  }
+
+  /**
+    * The abort error handler for typical cases, i.e. cromwell's API
+    */
+  private def standardAbortErrorHandler: PartialFunction[Throwable, Route] = {
+    case e: InvalidWorkflowException => e.failRequest(StatusCodes.BadRequest)
+    case e: WorkflowNotFoundException => e.errorRequest(StatusCodes.NotFound)
+    case _: AskTimeoutException if CromwellShutdown.shutdownInProgress() => serviceShuttingDownResponse
+    case e: TimeoutException => e.failRequest(StatusCodes.ServiceUnavailable)
+    case e: Exception => e.errorRequest(StatusCodes.InternalServerError)
+  }
+
+  def validateWorkflowIdInMetadata(possibleWorkflowId: String,
+                                   serviceRegistryActor: ActorRef)
+                                  (implicit timeout: Timeout, executor: ExecutionContext): Future[WorkflowId] = {
     Try(WorkflowId.fromString(possibleWorkflowId)) match {
       case Success(w) =>
-        serviceRegistryActor.ask(ValidateWorkflowId(w)).mapTo[WorkflowValidationResponse] map {
+        serviceRegistryActor.ask(ValidateWorkflowIdInMetadata(w)).mapTo[WorkflowValidationResponse] map {
           case RecognizedWorkflowId => w
           case UnrecognizedWorkflowId => throw UnrecognizedWorkflowException(w)
           case FailedToCheckWorkflowId(t) => throw t
@@ -257,23 +297,18 @@ object CromwellApiService {
     }
   }
 
-  def completeResponse[A](statusCode: StatusCode, value: A, warnings: Seq[String])
-                         (implicit mt: ToEntityMarshaller[A]): Route = {
-    val warningHeaders = warnings.toIndexedSeq map { warning =>
-      /*
-      Need a quoted string.
-      https://stackoverflow.com/questions/7886782
-
-      Using a poor version of ~~#!
-      https://github.com/akka/akka-http/blob/v10.0.9/akka-http-core/src/main/scala/akka/http/impl/util/Rendering.scala#L206
-       */
-      val quotedString = "\"" + warning.replaceAll("\"","\\\\\"").replaceAll("[\\r\\n]+", " ").trim + "\""
-
-      // https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.46
-      RawHeader("Warning", s"299 cromwell/$cromwellVersion $quotedString")
+  def validateWorkflowIdInMetadataSummaries(possibleWorkflowId: String,
+                                            serviceRegistryActor: ActorRef)
+                                           (implicit timeout: Timeout, executor: ExecutionContext): Future[WorkflowId] = {
+    Try(WorkflowId.fromString(possibleWorkflowId)) match {
+      case Success(w) =>
+        serviceRegistryActor.ask(ValidateWorkflowIdInMetadataSummaries(w)).mapTo[WorkflowValidationResponse] map {
+          case RecognizedWorkflowId => w
+          case UnrecognizedWorkflowId => throw UnrecognizedWorkflowException(w)
+          case FailedToCheckWorkflowId(t) => throw t
+        }
+      case Failure(_) => Future.failed(InvalidWorkflowException(possibleWorkflowId))
     }
-
-    complete((statusCode, warningHeaders, value))
   }
 
   final case class BackendResponse(supportedBackends: List[String], defaultBackend: String)

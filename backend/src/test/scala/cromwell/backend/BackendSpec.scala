@@ -6,7 +6,7 @@ import cromwell.backend.BackendJobExecutionActor.{BackendJobExecutionResponse, J
 import cromwell.backend.io.TestWorkflows._
 import cromwell.core.callcaching.NoDocker
 import cromwell.core.labels.Labels
-import cromwell.core.{WorkflowId, WorkflowOptions}
+import cromwell.core.{HogGroup, WorkflowId, WorkflowOptions}
 import common.exception.AggregatedException
 import org.scalatest.Matchers
 import org.scalatest.concurrent.{ScalaFutures, ScaledTimeSpans}
@@ -45,7 +45,10 @@ trait BackendSpec extends ScalaFutures with Matchers with Mockito with ScaledTim
       executable.entryPoint,
       executable.resolvedExecutableInputs.flatMap({case (port, v) => v.select[WomValue] map { port -> _ }}),
       options,
-      Labels.empty
+      Labels.empty,
+      HogGroup("foo"),
+      List.empty,
+      None
     )
   }
 
@@ -99,7 +102,7 @@ trait BackendSpec extends ScalaFutures with Matchers with Mockito with ScaledTim
     }.toMap
     val evaluatedAttributes = RuntimeAttributeDefinition.evaluateRuntimeAttributes(call.callable.runtimeAttributes, NoIoFunctionSet, Map.empty).getOrElse(fail("Failed to evaluate runtime attributes")) // .get is OK here because this is a test
     val runtimeAttributes = RuntimeAttributeDefinition.addDefaultsToAttributes(runtimeAttributeDefinitions, options)(evaluatedAttributes)
-    BackendJobDescriptor(workflowDescriptor, jobKey, runtimeAttributes, inputDeclarations, NoDocker, Map.empty)
+    BackendJobDescriptor(workflowDescriptor, jobKey, runtimeAttributes, inputDeclarations, NoDocker, None, Map.empty)
   }
 
   def jobDescriptorFromSingleCallWorkflow(wdl: WorkflowSource,
@@ -111,7 +114,7 @@ trait BackendSpec extends ScalaFutures with Matchers with Mockito with ScaledTim
     val inputDeclarations = fqnMapToDeclarationMap(workflowDescriptor.knownValues)
     val evaluatedAttributes = RuntimeAttributeDefinition.evaluateRuntimeAttributes(call.callable.runtimeAttributes, NoIoFunctionSet, inputDeclarations).getOrElse(fail("Failed to evaluate runtime attributes")) // .get is OK here because this is a test
     val runtimeAttributes = RuntimeAttributeDefinition.addDefaultsToAttributes(runtimeAttributeDefinitions, options)(evaluatedAttributes)
-    BackendJobDescriptor(workflowDescriptor, jobKey, runtimeAttributes, inputDeclarations, NoDocker, Map.empty)
+    BackendJobDescriptor(workflowDescriptor, jobKey, runtimeAttributes, inputDeclarations, NoDocker, None, Map.empty)
   }
 
   def jobDescriptorFromSingleCallWorkflow(wdl: WorkflowSource,
@@ -125,7 +128,7 @@ trait BackendSpec extends ScalaFutures with Matchers with Mockito with ScaledTim
     val inputDeclarations = fqnMapToDeclarationMap(workflowDescriptor.knownValues)
     val evaluatedAttributes = RuntimeAttributeDefinition.evaluateRuntimeAttributes(call.callable.runtimeAttributes, NoIoFunctionSet, inputDeclarations).getOrElse(fail("Failed to evaluate runtime attributes")) // .get is OK here because this is a test
     val runtimeAttributes = RuntimeAttributeDefinition.addDefaultsToAttributes(runtimeAttributeDefinitions, options)(evaluatedAttributes)
-    BackendJobDescriptor(workflowDescriptor, jobKey, runtimeAttributes, inputDeclarations, NoDocker, Map.empty)
+    BackendJobDescriptor(workflowDescriptor, jobKey, runtimeAttributes, inputDeclarations, NoDocker, None, Map.empty)
   }
 
   def assertResponse(executionResponse: BackendJobExecutionResponse, expectedResponse: BackendJobExecutionResponse) = {

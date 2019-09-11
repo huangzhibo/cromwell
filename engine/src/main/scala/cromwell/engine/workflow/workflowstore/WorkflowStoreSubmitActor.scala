@@ -3,26 +3,22 @@ package cromwell.engine.workflow.workflowstore
 import java.time.OffsetDateTime
 
 import akka.actor.{Actor, ActorLogging, ActorRef, Props}
-import cats.Monad
-import cats.data.EitherT._
 import cats.data.NonEmptyList
-import cats.instances.future._
-import cats.instances.list._
-import cats.syntax.traverse._
-import common.validation.Parse._
+import common.validation.IOChecked._
+import common.validation.Validation._
 import cromwell.core.Dispatcher._
 import cromwell.core._
-import cromwell.database.sql.tables.WorkflowStoreEntry.WorkflowStoreState
-import cromwell.database.sql.tables.WorkflowStoreEntry.WorkflowStoreState.WorkflowStoreState
 import cromwell.engine.instrumentation.WorkflowInstrumentation
 import cromwell.engine.workflow.WorkflowMetadataHelper
-import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.WorkflowSubmissionResponse
+import cromwell.engine.workflow.WorkflowProcessingEventPublishing._
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.WorkflowStoreState.WorkflowStoreState
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.{WorkflowStoreState, WorkflowSubmissionResponse}
 import cromwell.engine.workflow.workflowstore.WorkflowStoreActor._
 import cromwell.engine.workflow.workflowstore.WorkflowStoreSubmitActor.{WorkflowSubmitFailed, WorkflowSubmittedToStore, WorkflowsBatchSubmittedToStore}
 import cromwell.services.metadata.MetadataService.PutMetadataAction
 import cromwell.services.metadata.{MetadataEvent, MetadataKey, MetadataValue}
-import spray.json.{JsObject, JsString, _}
-import wom.core.WorkflowOptionsJson
+import spray.json._
+
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
@@ -38,17 +34,20 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
       val futureResponse = for {
         submissionResponses <- storeWorkflowSources(NonEmptyList.of(cmd.source))
         id = submissionResponses.head.id
-        _ <- registerSubmission(id, cmd.source)
+        _ = registerSubmission(id, cmd.source)
       } yield WorkflowSubmissionResponse(submissionResponses.head.state, id)
 
       futureResponse onComplete {
-        case Success(futureResponse) =>
+        case Success(workflowSubmissionResponse) =>
           val wfType = cmd.source.workflowType.getOrElse("Unspecified type")
           val wfTypeVersion = cmd.source.workflowTypeVersion.getOrElse("Unspecified version")
-          log.info("{} ({}) workflow {} submitted", wfType, wfTypeVersion, futureResponse.id)
+          log.info("{} ({}) workflow {} submitted", wfType, wfTypeVersion, workflowSubmissionResponse.id)
           val labelsMap = convertJsonToLabelsMap(cmd.source.labelsJson)
-          publishLabelsToMetadata(futureResponse.id, labelsMap)
-          sndr ! WorkflowSubmittedToStore(futureResponse.id, convertDatabaseStateToApiState(futureResponse.state))
+          publishLabelsToMetadata(workflowSubmissionResponse.id, labelsMap, serviceRegistryActor).toErrorOr.toTry.get
+          sndr ! WorkflowSubmittedToStore(
+            workflowSubmissionResponse.id,
+            convertDatabaseStateToApiState(workflowSubmissionResponse.state)
+          )
           removeWork()
         case Failure(throwable) =>
           log.error("Workflow {} submit failed.", throwable)
@@ -62,15 +61,18 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
 
       val futureResponses = for {
         submissionResponses <- storeWorkflowSources(cmd.sources)
-        _ <- (submissionResponses.toList.map(res => res.id) zip cmd.sources.toList) traverse (registerSubmission _).tupled
+        _ = (submissionResponses.toList.map(res => res.id) zip cmd.sources.toList) foreach (registerSubmission _).tupled
       } yield submissionResponses
 
       futureResponses onComplete {
-        case Success(futureResponses) =>
-          log.info("Workflows {} submitted.", futureResponses.toList.map(res => res.id).mkString(", "))
+        case Success(workflowSubmissionResponses) =>
+          log.info("Workflows {} submitted.", workflowSubmissionResponses.toList.map(res => res.id).mkString(", "))
           val labelsMap = convertJsonToLabelsMap(cmd.sources.head.labelsJson)
-          futureResponses.map(res => publishLabelsToMetadata(res.id, labelsMap))
-          sndr ! WorkflowsBatchSubmittedToStore(futureResponses.map(res => res.id), convertDatabaseStateToApiState(futureResponses.head.state))
+          workflowSubmissionResponses.map(res => publishLabelsToMetadata(res.id, labelsMap, serviceRegistryActor))
+          sndr ! WorkflowsBatchSubmittedToStore(
+            workflowSubmissionResponses.map(res => res.id),
+            convertDatabaseStateToApiState(workflowSubmissionResponses.head.state)
+          )
           removeWork()
         case Failure(throwable) =>
           log.error("Workflow {} submit failed.", throwable)
@@ -92,17 +94,8 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
 
   private def storeWorkflowSources(sources: NonEmptyList[WorkflowSourceFilesCollection]): Future[NonEmptyList[WorkflowSubmissionResponse]] = {
     for {
-      processedSources <- processSources(sources, _.asPrettyJson)
-      workflowSubmissionResponses <- store.add(processedSources)
+      workflowSubmissionResponses <- store.add(sources)
     } yield workflowSubmissionResponses
-  }
-
-  private def processSources(sources: NonEmptyList[WorkflowSourceFilesCollection],
-                             processOptions: WorkflowOptions => WorkflowOptionsJson): Future[NonEmptyList[WorkflowSourceFilesCollection]] = {
-    val nelFutures: NonEmptyList[Future[WorkflowSourceFilesCollection]] = sources map processSource(processOptions)
-    val listFutures: List[Future[WorkflowSourceFilesCollection]] = nelFutures.toList
-    val futureLists: Future[List[WorkflowSourceFilesCollection]] = Future.sequence(listFutures)
-    futureLists.map(seq => NonEmptyList.fromList(seq).get)
   }
 
   private def convertJsonToLabelsMap(json: String): Map[String, String] = {
@@ -114,17 +107,6 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
     }
   }
 
-  private def publishLabelsToMetadata(rootWorkflowId: WorkflowId, customLabels: Map[String, String]): Parse[Unit] = {
-    val defaultLabel = "cromwell-workflow-id" -> s"cromwell-$rootWorkflowId"
-    Monad[Parse].pure(labelsToMetadata(customLabels + defaultLabel, rootWorkflowId))
-  }
-
-  protected def labelsToMetadata(labels: Map[String, String], workflowId: WorkflowId): Unit = {
-    labels foreach { case (k, v) =>
-      serviceRegistryActor ! PutMetadataAction(MetadataEvent(MetadataKey(workflowId, None, s"${WorkflowMetadataKeys.Labels}:$k"), MetadataValue(v)))
-    }
-  }
-
   /**
     * Runs processing on workflow source files before they are stored.
     *
@@ -132,16 +114,10 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
     * @param source         Original workflow source
     * @return Attempted updated workflow source
     */
-  private def processSource(processOptions: WorkflowOptions => WorkflowOptionsJson)
-                           (source: WorkflowSourceFilesCollection): Future[WorkflowSourceFilesCollection] = {
-    val options = Future {
-      WorkflowOptions.fromJsonString(source.workflowOptionsJson)
-    }.flatMap {
-      case Success(s) => Future.successful(s)
-      case Failure(regrets) => Future.failed(regrets)
-    }
+  private def processSource(processOptions: WorkflowOptions => WorkflowOptions)
+                           (source: WorkflowSourceFilesCollection): WorkflowSourceFilesCollection = {
 
-    options map {o => source.copyOptions(processOptions(o)) }
+    source.setOptions(processOptions(source.workflowOptions))
   }
 
   /**
@@ -149,7 +125,7 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
     */
   private def registerSubmission(
       id: WorkflowId,
-      originalSourceFiles: WorkflowSourceFilesCollection): Future[Unit] = {
+      originalSourceFiles: WorkflowSourceFilesCollection): Unit = {
     // Increment the workflow submitted count
     incrementWorkflowState(WorkflowSubmitted)
 
@@ -158,9 +134,10 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
     else
       WorkflowSubmitted
 
-    processSource(_.clearEncryptedValues)(originalSourceFiles) map { sourceFiles =>
+    val sourceFiles = processSource(_.clearEncryptedValues)(originalSourceFiles)
+
       val submissionEvents: List[MetadataEvent] = List(
-        MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.SubmissionTime), MetadataValue(OffsetDateTime.now.toString)),
+        MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.SubmissionTime), MetadataValue(OffsetDateTime.now)),
         MetadataEvent.empty(MetadataKey(id, None, WorkflowMetadataKeys.Inputs)),
         MetadataEvent.empty(MetadataKey(id, None, WorkflowMetadataKeys.Outputs)),
         MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.Status), MetadataValue(actualWorkflowState)),
@@ -169,7 +146,7 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
         MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.SubmissionSection, WorkflowMetadataKeys.SubmissionSection_WorkflowUrl), MetadataValue(sourceFiles.workflowUrl.orNull)),
         MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.SubmissionSection, WorkflowMetadataKeys.SubmissionSection_Root), MetadataValue(sourceFiles.workflowRoot.orNull)),
         MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.SubmissionSection, WorkflowMetadataKeys.SubmissionSection_Inputs), MetadataValue(sourceFiles.inputsJson)),
-        MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.SubmissionSection, WorkflowMetadataKeys.SubmissionSection_Options), MetadataValue(sourceFiles.workflowOptionsJson)),
+        MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.SubmissionSection, WorkflowMetadataKeys.SubmissionSection_Options), MetadataValue(sourceFiles.workflowOptions.asPrettyJson)),
         MetadataEvent(MetadataKey(id, None, WorkflowMetadataKeys.SubmissionSection, WorkflowMetadataKeys.SubmissionSection_Labels), MetadataValue(sourceFiles.labelsJson))
       )
 
@@ -181,7 +158,6 @@ final case class WorkflowStoreSubmitActor(store: WorkflowStore, serviceRegistryA
 
       serviceRegistryActor ! PutMetadataAction(submissionEvents ++ workflowTypeAndVersionEvents.flatten)
       ()
-    }
   }
 }
 

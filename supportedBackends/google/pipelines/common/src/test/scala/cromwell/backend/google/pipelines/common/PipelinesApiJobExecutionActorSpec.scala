@@ -24,7 +24,7 @@ class PipelinesApiJobExecutionActorSpec extends TestKitSuite("PipelinesApiJobExe
   implicit val ec: ExecutionContext = system.dispatcher
 
   it should "catch failures in PABJEA initialization and fail the job accordingly" in {
-    val jobDescriptor = mock[BackendJobDescriptor]
+    val jobDescriptor = BackendJobDescriptor(null, null, null, Map.empty, null, null, null)
     val jesWorkflowInfo = mock[PipelinesApiConfiguration]
     val initializationData = mock[PipelinesApiBackendInitializationData]
     val serviceRegistryActor = system.actorOf(Props.empty)
@@ -51,12 +51,12 @@ class PipelinesApiJobExecutionActorSpec extends TestKitSuite("PipelinesApiJobExe
 
     parent.expectMsgPF(max = TimeoutDuration) {
       case JobFailedNonRetryableResponse(_, throwable, _) =>
-        throwable.getMessage should be("PipelinesApiAsyncBackendJobExecutionActor failed and didn't catch its exception.")
+        throwable.getMessage should be("PipelinesApiAsyncBackendJobExecutionActor failed and didn't catch its exception. This condition has been handled and the job will be marked as failed.")
     }
   }
 
   it should "catch failures at a random point during PABJEA processing and fail the job accordingly" in {
-    val jobDescriptor = mock[BackendJobDescriptor]
+    val jobDescriptor = BackendJobDescriptor(null, null, null, Map.empty, null, null, null)
     val jesWorkflowInfo = mock[PipelinesApiConfiguration]
     val initializationData = mock[PipelinesApiBackendInitializationData]
     val serviceRegistryActor = system.actorOf(Props.empty)
@@ -97,7 +97,7 @@ class PipelinesApiJobExecutionActorSpec extends TestKitSuite("PipelinesApiJobExe
 
     parent.expectMsgPF(max = TimeoutDuration) {
       case JobFailedNonRetryableResponse(_, throwable, _) =>
-        throwable.getMessage should be("PipelinesApiAsyncBackendJobExecutionActor failed and didn't catch its exception.")
+        throwable.getMessage should be("PipelinesApiAsyncBackendJobExecutionActor failed and didn't catch its exception. This condition has been handled and the job will be marked as failed.")
     }
   }
 }

@@ -3,45 +3,86 @@ package cromwell.engine.workflow.workflowstore
 import java.time.OffsetDateTime
 
 import cats.data.NonEmptyList
-import com.typesafe.config.ConfigFactory
+import cats.syntax.apply._
 import common.validation.ErrorOr.ErrorOr
-import cromwell.core.{WorkflowId, WorkflowSourceFilesCollection}
+import common.validation.Validation._
+import cromwell.core.{HogGroup, WorkflowId, WorkflowOptions, WorkflowSourceFilesCollection}
 import cromwell.database.sql.SqlConverters._
 import cromwell.database.sql.WorkflowStoreSqlDatabase
 import cromwell.database.sql.tables.WorkflowStoreEntry
-import cromwell.database.sql.tables.WorkflowStoreEntry.WorkflowStoreState
-import cromwell.database.sql.tables.WorkflowStoreEntry.WorkflowStoreState.WorkflowStoreState
-import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.WorkflowSubmissionResponse
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.WorkflowStoreAbortResponse.WorkflowStoreAbortResponse
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.WorkflowStoreState.WorkflowStoreState
+import cromwell.engine.workflow.workflowstore.SqlWorkflowStore.{NotInOnHoldStateException, WorkflowStoreAbortResponse, WorkflowStoreState, WorkflowSubmissionResponse}
 import eu.timepit.refined.api.Refined
 import eu.timepit.refined.collection._
-import net.ceedubs.ficus.Ficus._
 
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 
 object SqlWorkflowStore {
   case class WorkflowSubmissionResponse(state: WorkflowStoreState, id: WorkflowId)
+
+  case class NotInOnHoldStateException(workflowId: WorkflowId) extends
+    Exception(
+      s"Couldn't change status of workflow $workflowId to " +
+        "'Submitted' because the workflow is not in 'On Hold' state"
+    )
+
+  object WorkflowStoreState extends Enumeration {
+    type WorkflowStoreState = Value
+    val Submitted = Value("Submitted")
+    val Running = Value("Running")
+    val Aborting = Value("Aborting")
+    val OnHold = Value("On Hold")
+  }
+
+  object WorkflowStoreAbortResponse extends Enumeration {
+    type WorkflowStoreAbortResponse = Value
+    val NotFound = Value("NotFound")
+    val AbortedOnHoldOrSubmitted = Value("AbortedOnHoldOrSubmitted")
+    val AbortRequested = Value("AbortRequested")
+  }
 }
 
 case class SqlWorkflowStore(sqlDatabase: WorkflowStoreSqlDatabase) extends WorkflowStore {
-  lazy val cromwellId = ConfigFactory.load().as[Option[String]]("system.cromwell_id")
-
   /** This is currently hardcoded to success but used to do stuff, left in place for now as a useful
     *  startup initialization hook. */
   override def initialize(implicit ec: ExecutionContext): Future[Unit] = Future.successful(())
 
-  override def aborting(id: WorkflowId)(implicit ec: ExecutionContext): Future[Option[Boolean]] = {
-    sqlDatabase.setToAborting(id.toString)
+  override def aborting(id: WorkflowId)(implicit ec: ExecutionContext): Future[WorkflowStoreAbortResponse] = {
+    sqlDatabase.deleteOrUpdateWorkflowToState(
+      workflowExecutionUuid = id.toString,
+      workflowStateToDelete1 = WorkflowStoreState.OnHold.toString,
+      workflowStateToDelete2 = WorkflowStoreState.Submitted.toString,
+      workflowStateForUpdate = WorkflowStoreState.Aborting.toString
+    ) map {
+      case Some(true) =>
+        WorkflowStoreAbortResponse.AbortedOnHoldOrSubmitted
+      case Some(false) =>
+        WorkflowStoreAbortResponse.AbortRequested
+      case None =>
+        WorkflowStoreAbortResponse.NotFound
+    }
   }
-  
+
+  override def findWorkflows(cromwellId: String)(implicit ec: ExecutionContext): Future[Iterable[WorkflowId]] = {
+    sqlDatabase.findWorkflows(cromwellId) map { _ map WorkflowId.fromString }
+  }
+
+  override def findWorkflowsWithAbortRequested(cromwellId: String)(implicit ec: ExecutionContext): Future[Iterable[WorkflowId]] = {
+    sqlDatabase.findWorkflowsWithAbortRequested(cromwellId) map { _ map WorkflowId.fromString }
+  }
+
   override def abortAllRunning()(implicit ec: ExecutionContext): Future[Unit] = {
-    sqlDatabase.setAllRunningToAborting()
+    sqlDatabase.setStateToState(WorkflowStoreState.Running.toString, WorkflowStoreState.Aborting.toString)
   }
 
-  override def stats(implicit ec: ExecutionContext): Future[Map[WorkflowStoreState, Int]] = sqlDatabase.stats
-
-  override def remove(id: WorkflowId)(implicit ec: ExecutionContext): Future[Boolean] = {
-    sqlDatabase.removeWorkflowStoreEntry(id.toString).map(_ > 0) // i.e. did anything get deleted
+  override def stats(implicit ec: ExecutionContext): Future[Map[WorkflowStoreState, Int]] = {
+    sqlDatabase.workflowStateCounts.map {
+      _ map {
+        case (key, value) => WorkflowStoreState.withName(key) -> value
+      }
+    }
   }
 
   /**
@@ -52,14 +93,25 @@ case class SqlWorkflowStore(sqlDatabase: WorkflowStoreSqlDatabase) extends Workf
     import cats.instances.list._
     import cats.syntax.traverse._
     import common.validation.Validation._
-    sqlDatabase.fetchStartableWorkflows(n, cromwellId, heartbeatTtl) map {
+    sqlDatabase.fetchWorkflowsInState(
+      n,
+      cromwellId,
+      heartbeatTtl.ago,
+      OffsetDateTime.now.toSystemTimestamp,
+      WorkflowStoreState.Submitted.toString,
+      WorkflowStoreState.Running.toString,
+      WorkflowStoreState.OnHold.toString
+    ) map {
       // .get on purpose here to fail the future if something went wrong
       _.toList.traverse(fromWorkflowStoreEntry).toTry.get
     }
   }
 
-  override def writeWorkflowHeartbeats(workflowIds: Set[WorkflowId])(implicit ec: ExecutionContext): Future[Int] = {
-    sqlDatabase.writeWorkflowHeartbeats(workflowIds map { _.toString })
+  override def writeWorkflowHeartbeats(workflowIds: Set[(WorkflowId, OffsetDateTime)],
+                                       heartbeatDateTime: OffsetDateTime)
+                                      (implicit ec: ExecutionContext): Future[Int] = {
+    val sortedWorkflowIds = workflowIds.toList sortBy(_._2) map (_._1.toString)
+    sqlDatabase.writeWorkflowHeartbeats(sortedWorkflowIds, heartbeatDateTime.toSystemTimestamp)
   }
 
   /**
@@ -71,7 +123,8 @@ case class SqlWorkflowStore(sqlDatabase: WorkflowStoreSqlDatabase) extends Workf
     val asStoreEntries = sources map toWorkflowStoreEntry
     val returnValue = asStoreEntries map { workflowStore =>
       WorkflowSubmissionResponse(
-        workflowStore.workflowState, WorkflowId.fromString(workflowStore.workflowExecutionUuid)
+        WorkflowStoreState.withName(workflowStore.workflowState),
+        WorkflowId.fromString(workflowStore.workflowExecutionUuid)
       )
     }
 
@@ -80,30 +133,48 @@ case class SqlWorkflowStore(sqlDatabase: WorkflowStoreSqlDatabase) extends Workf
   }
 
   override def switchOnHoldToSubmitted(id: WorkflowId)(implicit ec: ExecutionContext): Future[Unit] = {
-    sqlDatabase.setOnHoldToSubmitted(id.toString)
+    for {
+      updated <- sqlDatabase.updateWorkflowState(
+        id.toString,
+        WorkflowStoreState.OnHold.toString,
+        WorkflowStoreState.Submitted.toString
+      )
+      _ <- if (updated == 0) Future.failed(NotInOnHoldStateException(id)) else Future.successful(())
+    } yield ()
   }
 
 
   private def fromWorkflowStoreEntry(workflowStoreEntry: WorkflowStoreEntry): ErrorOr[WorkflowToStart] = {
-    val sources = WorkflowSourceFilesCollection(
-      workflowSource = workflowStoreEntry.workflowDefinition.toRawStringOption,
-      workflowUrl = workflowStoreEntry.workflowUrl,
-      workflowRoot = workflowStoreEntry.workflowRoot,
-      workflowType = workflowStoreEntry.workflowType,
-      workflowTypeVersion = workflowStoreEntry.workflowTypeVersion,
-      inputsJson = workflowStoreEntry.workflowInputs.toRawString,
-      workflowOptionsJson = workflowStoreEntry.workflowOptions.toRawString,
-      labelsJson = workflowStoreEntry.customLabels.toRawString,
-      importsFile = workflowStoreEntry.importsZip.toBytesOption,
-      warnings = Vector.empty,
-      workflowOnHold = false
-    )
 
-    workflowStoreStateToStartableState(workflowStoreEntry) map { startableState =>
+    val workflowOptionsValidation: ErrorOr[WorkflowOptions] = WorkflowOptions.fromJsonString(workflowStoreEntry.workflowOptions.toRawString).toErrorOr
+    val startableStateValidation = workflowStoreStateToStartableState(workflowStoreEntry)
+
+    (startableStateValidation, workflowOptionsValidation) mapN { (startableState, workflowOptions) =>
+
+      val sources = WorkflowSourceFilesCollection(
+        workflowSource = workflowStoreEntry.workflowDefinition.toRawStringOption,
+        workflowUrl = workflowStoreEntry.workflowUrl,
+        workflowRoot = workflowStoreEntry.workflowRoot,
+        workflowType = workflowStoreEntry.workflowType,
+        workflowTypeVersion = workflowStoreEntry.workflowTypeVersion,
+        inputsJson = workflowStoreEntry.workflowInputs.toRawString,
+        workflowOptions = workflowOptions,
+        labelsJson = workflowStoreEntry.customLabels.toRawString,
+        importsFile = workflowStoreEntry.importsZip.toBytesOption,
+        warnings = Vector.empty,
+        workflowOnHold = false
+      )
+
+      val id = WorkflowId.fromString(workflowStoreEntry.workflowExecutionUuid)
+      val hogGroup: HogGroup = workflowStoreEntry.hogGroup.map(HogGroup(_)).getOrElse(HogGroup.decide(workflowOptions, id))
+
       WorkflowToStart(
-        WorkflowId.fromString(workflowStoreEntry.workflowExecutionUuid),
-        sources,
-        startableState)
+        id = id,
+        submissionTime = workflowStoreEntry.submissionTime.toSystemOffsetDateTime,
+        sources = sources,
+        state = startableState,
+        hogGroup = hogGroup
+      )
     }
   }
 
@@ -120,26 +191,30 @@ case class SqlWorkflowStore(sqlDatabase: WorkflowStoreSqlDatabase) extends Workf
 
     val actualWorkflowState = workflowSubmissionState(workflowSourceFiles)
 
+    val workflowId = WorkflowId.randomId()
+    val hogGroup = HogGroup.decide(workflowSourceFiles.workflowOptions, workflowId)
+
     WorkflowStoreEntry(
-      workflowExecutionUuid = WorkflowId.randomId().toString,
+      workflowExecutionUuid = workflowId.toString,
       workflowDefinition = workflowSourceFiles.workflowSource.toClobOption,
       workflowUrl = workflowSourceFiles.workflowUrl,
       workflowRoot = workflowSourceFiles.workflowRoot,
       workflowType = workflowSourceFiles.workflowType,
       workflowTypeVersion = workflowSourceFiles.workflowTypeVersion,
       workflowInputs = workflowSourceFiles.inputsJson.toClobOption,
-      workflowOptions = workflowSourceFiles.workflowOptionsJson.toClobOption,
+      workflowOptions = workflowSourceFiles.workflowOptions.asPrettyJson.toClobOption,
       customLabels = workflowSourceFiles.labelsJson.toClob(default = nonEmptyJsonString),
-      workflowState = actualWorkflowState,
+      workflowState = actualWorkflowState.toString,
       cromwellId = None,
       heartbeatTimestamp = None,
       submissionTime = OffsetDateTime.now.toSystemTimestamp,
-      importsZip = workflowSourceFiles.importsZipFileOption.toBlobOption
+      importsZip = workflowSourceFiles.importsZipFileOption.toBlobOption,
+      hogGroup = Option(hogGroup.value)
     )
   }
 
   private def workflowStoreStateToStartableState(workflowStoreEntry: WorkflowStoreEntry): ErrorOr[StartableState] = {
-    val workflowState = workflowStoreEntry.workflowState
+    val workflowState = WorkflowStoreState.withName(workflowStoreEntry.workflowState)
     import cats.syntax.validated._
     // A workflow is startable if it's in Submitted, Running or Aborting state.
     workflowState match {

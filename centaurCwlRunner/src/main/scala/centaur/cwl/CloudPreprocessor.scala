@@ -1,14 +1,15 @@
 package centaur.cwl
 import better.files.File
 import com.typesafe.config.Config
-import common.validation.Parse.Parse
+import common.util.StringUtil._
+import common.validation.IOChecked.IOChecked
 import cwl.preprocessor.CwlPreProcessor
 import io.circe.optics.JsonPath
 import io.circe.optics.JsonPath._
 import io.circe.yaml.Printer.StringStyle
 import io.circe.{Json, yaml}
 import net.ceedubs.ficus.Ficus._
-import common.util.StringUtil._
+import wom.util.YamlUtils
 
 /**
   * Tools to pre-process the CWL workflows and inputs before feeding them to Cromwell so they can be executed on PAPI.
@@ -39,7 +40,7 @@ class CloudPreprocessor(config: Config, prefixConfigPath: String) {
 
   // Parse value, apply f to it, and print it back to String using the printer
   private def process(value: String, f: Json => Json, printer: Json => String) = {
-    yaml.parser.parse(value) match {
+    YamlUtils.parse(value) match {
       case Left(error) => throw new Exception(error.getMessage)
       case Right(json) => printer(f(json))
     }
@@ -62,7 +63,7 @@ class CloudPreprocessor(config: Config, prefixConfigPath: String) {
   /**
     * Pre-process input file by prefixing all files and directories with the cloud prefix
     */
-  def preProcessInput(input: String): Parse[String] = cwlPreProcessor.preProcessInputFiles(input, prefixLocation)
+  def preProcessInput(input: String): IOChecked[String] = cwlPreProcessor.preProcessInputFiles(input, prefixLocation)
 
   // Check if the given path (as an array or object) has a DockerRequirement element
   def hasDocker(jsonPath: JsonPath)(json: Json): Boolean = {
@@ -92,7 +93,7 @@ class CloudPreprocessor(config: Config, prefixConfigPath: String) {
       .getOrElse(workflow.deepMerge(DefaultDockerHintList))
   } else workflow
   
-  private val prefixDefaultFilesInCwl = cwlPreProcessor.mapFilesAndDirectories(prefixLocation) _
+  private val prefixDefaultFilesInCwl = CwlPreProcessor.mapFilesAndDirectories(prefixLocation) _
 
   /**
     * Pre-process the workflow by adding a default docker hint iff it doesn't have one

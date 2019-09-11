@@ -14,6 +14,8 @@ import common.validation.ErrorOr._
 import common.validation.Validation._
 import cromwell.backend._
 import cromwell.backend.async.{AbortedExecutionHandle, ExecutionHandle, FailedNonRetryableExecutionHandle, FailedRetryableExecutionHandle, PendingExecutionHandle}
+import cromwell.backend.google.pipelines.common.PipelinesApiConfigurationAttributes.LocalizationConfiguration
+import cromwell.backend.google.pipelines.common.PipelinesApiJobPaths.GcsTransferLibraryName
 import cromwell.backend.google.pipelines.common.api.PipelinesApiRequestFactory._
 import cromwell.backend.google.pipelines.common.api.RunStatus.TerminalRunStatus
 import cromwell.backend.google.pipelines.common.api._
@@ -26,7 +28,7 @@ import cromwell.backend.standard.{StandardAdHocValue, StandardAsyncExecutionActo
 import cromwell.core._
 import cromwell.core.path.{DefaultPathBuilder, Path}
 import cromwell.core.retry.SimpleExponentialBackoff
-import cromwell.filesystems.demo.dos.DemoDosPath
+import cromwell.filesystems.drs.{DrsPath, DrsResolver}
 import cromwell.filesystems.gcs.GcsPath
 import cromwell.filesystems.gcs.batch.GcsBatchCommandBuilder
 import cromwell.filesystems.http.HttpPath
@@ -34,13 +36,16 @@ import cromwell.filesystems.sra.SraPath
 import cromwell.google.pipelines.common.PreviousRetryReasons
 import cromwell.services.keyvalue.KeyValueServiceActor._
 import cromwell.services.keyvalue.KvClient
+import cromwell.services.metadata.CallMetadataKeys
 import shapeless.Coproduct
+import wdl4s.parser.MemoryUnit
 import wom.CommandSetupSideEffectFile
 import wom.callable.AdHocValue
 import wom.callable.Callable.OutputDefinition
 import wom.callable.MetaValueElement.{MetaValueElementBoolean, MetaValueElementObject}
 import wom.core.FullyQualifiedName
 import wom.expression.{FileEvaluation, NoIoFunctionSet}
+import wom.format.MemorySize
 import wom.types.{WomArrayType, WomSingleFileType}
 import wom.values._
 
@@ -62,8 +67,14 @@ object PipelinesApiAsyncBackendJobExecutionActor {
   val JesUnexpectedTermination = 13
   val JesPreemption = 14
 
+  val PapiFailedPreConditionErrorCode = 9
+  val PapiMysteriouslyCrashedErrorCode = 10
+
   // If the JES code is 2 (UNKNOWN), this sub-string indicates preemption:
   val FailedToStartDueToPreemptionSubstring = "failed to start due to preemption"
+  val FailedV2Style = "The assigned worker has failed to complete the operation"
+
+  val plainTextContentType = Option(ContentTypes.`text/plain(UTF-8)`)
 
   def StandardException(errorCode: Status,
                         message: String,
@@ -82,7 +93,8 @@ object PipelinesApiAsyncBackendJobExecutionActor {
 
 class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: StandardAsyncExecutionActorParams)
   extends BackendJobLifecycleActor with StandardAsyncExecutionActor with PipelinesApiJobCachingActorHelper
-    with PipelinesApiStatusRequestClient with PipelinesApiRunCreationClient with PipelinesApiAbortClient with KvClient with PapiInstrumentation {
+    with PipelinesApiStatusRequestClient with PipelinesApiRunCreationClient with PipelinesApiAbortClient with KvClient
+    with PapiInstrumentation {
 
   override lazy val ioCommandBuilder = GcsBatchCommandBuilder
 
@@ -163,8 +175,7 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
   protected def relativeLocalizationPath(file: WomFile): WomFile = {
     file.mapFile(value =>
       getPath(value) match {
-        case Success(demoDosPath: DemoDosPath) =>
-          demoDosResolver.getContainerRelativePath(demoDosPath)
+        case Success(drsPath: DrsPath) => DrsResolver.getContainerRelativePath(drsPath).unsafeRunSync()
         case Success(path) => path.pathWithoutScheme
         case _ => value
       }
@@ -174,8 +185,7 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
   protected def fileName(file: WomFile): WomFile = {
     file.mapFile(value =>
       getPath(value) match {
-        case Success(demoDosPath: DemoDosPath) =>
-          DefaultPathBuilder.get(demoDosResolver.getContainerRelativePath(demoDosPath)).name
+        case Success(drsPath: DrsPath) => DefaultPathBuilder.get(DrsResolver.getContainerRelativePath(drsPath).unsafeRunSync()).name
         case Success(path) => path.name
         case _ => value
       }
@@ -354,7 +364,8 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
 
   lazy val monitoringOutput: Option[PipelinesApiFileOutput] = monitoringScript map { _ =>
     PipelinesApiFileOutput(s"$jesMonitoringParamName-out",
-      pipelinesApiCallPaths.jesMonitoringLogPath, localMonitoringLogPath, workingDisk, optional = false, secondary = false)
+      pipelinesApiCallPaths.jesMonitoringLogPath, localMonitoringLogPath, workingDisk, optional = false, secondary = false,
+      contentType = plainTextContentType)
   }
 
   override lazy val commandDirectory: Path = PipelinesApiWorkingDisk.MountPoint
@@ -391,13 +402,33 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
     }
   }
 
-  private def createPipelineParameters(inputOutputParameters: InputOutputParameters): CreatePipelineParameters = {
+  private def createPipelineParameters(inputOutputParameters: InputOutputParameters, customLabels: Seq[GoogleLabel]): CreatePipelineParameters = {
     standardParams.backendInitializationDataOption match {
       case Some(data: PipelinesApiBackendInitializationData) =>
         val dockerKeyAndToken: Option[CreatePipelineDockerKeyAndToken] = for {
           key <- data.privateDockerEncryptionKeyName
           token <- data.privateDockerEncryptedToken
         } yield CreatePipelineDockerKeyAndToken(key, token)
+
+        /*
+           * Right now this doesn't cost anything, because sizeOption returns the size if it was previously already fetched
+           * for some reason (expression evaluation for instance), but otherwise does not retrieve it and returns None.
+           * In CWL-land we tend to be aggressive in pre-fetching the size in order to be able to evaluate JS expressions,
+           * but less in WDL as we can get it last minute and on demand because size is a WDL function, whereas in CWL
+           * we don't inspect the JS to know if size is called and therefore always pre-fetch it.
+           *
+           * We could decide to call withSize before in which case we would retrieve the size for all files and have
+           * a guaranteed more accurate total size, but there might be performance impacts ?
+           */
+        val inputFileSize = Option(callInputFiles.values.flatMap(_.flatMap(_.sizeOption)).sum)
+
+        // Attempt to adjust the disk size by taking into account the size of input files
+        val adjustedSizeDisks = inputFileSize.map(size => MemorySize.apply(size.toDouble, MemoryUnit.Bytes).to(MemoryUnit.GB)) map { inputFileSizeInformation =>
+          runtimeAttributes.disks.adjustWorkingDiskWithNewMin(
+            inputFileSizeInformation,
+            jobLogger.info(s"Adjusted working disk size to ${inputFileSizeInformation.amount} GB to account for input files")
+          )
+        } getOrElse runtimeAttributes.disks
 
         CreatePipelineParameters(
           jobDescriptor = jobDescriptor,
@@ -407,14 +438,16 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
           cloudCallRoot = callRootPath,
           commandScriptContainerPath = cmdInput.containerPath,
           logGcsPath = jesLogPath,
-          inputOutputParameters,
-          googleProject(jobDescriptor.workflowDescriptor),
-          computeServiceAccount(jobDescriptor.workflowDescriptor),
-          backendLabels,
-          preemptible,
-          pipelinesConfiguration.jobShell,
-          dockerKeyAndToken,
-          jobDescriptor.workflowDescriptor.outputRuntimeExtractor
+          inputOutputParameters = inputOutputParameters,
+          projectId = googleProject(jobDescriptor.workflowDescriptor),
+          computeServiceAccount = computeServiceAccount(jobDescriptor.workflowDescriptor),
+          googleLabels = backendLabels ++ customLabels,
+          preemptible = preemptible,
+          jobShell = pipelinesConfiguration.jobShell,
+          privateDockerKeyAndEncryptedToken = dockerKeyAndToken,
+          womOutputRuntimeExtractor = jobDescriptor.workflowDescriptor.outputRuntimeExtractor,
+          adjustedSizeDisks = adjustedSizeDisks,
+          virtualPrivateCloudConfiguration = jesAttributes.virtualPrivateCloudConfiguration
         )
       case Some(other) =>
         throw new RuntimeException(s"Unexpected initialization data: $other")
@@ -442,12 +475,25 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
     Future.successful(PendingExecutionHandle(jobDescriptor, jobForResumption, Option(Run(jobForResumption)), previousState = None))
   }
 
+  protected def uploadGcsTransferLibrary(createPipelineParameters: CreatePipelineParameters, cloudPath: Path, localizationConfiguration: LocalizationConfiguration): Future[Unit] = Future.successful(())
+
+  protected def uploadGcsLocalizationScript(createPipelineParameters: CreatePipelineParameters,
+                                            cloudPath: Path,
+                                            transferLibraryContainerPath: Path,
+                                            localizationConfiguration: LocalizationConfiguration): Future[Unit] = Future.successful(())
+
+  protected def uploadGcsDelocalizationScript(createPipelineParameters: CreatePipelineParameters,
+                                              cloudPath: Path,
+                                              transferLibraryContainerPath: Path,
+                                              localizationConfiguration: LocalizationConfiguration): Future[Unit] = Future.successful(())
+
   private def createNewJob(): Future[ExecutionHandle] = {
     // Want to force runtimeAttributes to evaluate so we can fail quickly now if we need to:
     def evaluateRuntimeAttributes = Future.fromTry(Try(runtimeAttributes))
 
     def generateInputOutputParameters: Future[InputOutputParameters] = Future.fromTry(Try {
-      val rcFileOutput = PipelinesApiFileOutput(returnCodeFilename, returnCodeGcsPath, DefaultPathBuilder.get(returnCodeFilename), workingDisk, optional = false, secondary = false)
+      val rcFileOutput = PipelinesApiFileOutput(returnCodeFilename, returnCodeGcsPath, DefaultPathBuilder.get(returnCodeFilename), workingDisk, optional = false, secondary = false,
+        contentType = plainTextContentType)
 
       case class StandardStream(name: String, f: StandardPaths => Path) {
         val filename = f(pipelinesApiCallPaths.standardPaths).name
@@ -458,7 +504,7 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
         StandardStream("stderr", _.error)
       ) map { s =>
         PipelinesApiFileOutput(s.name, returnCodeGcsPath.sibling(s.filename), DefaultPathBuilder.get(s.filename),
-          workingDisk, optional = false, secondary = false, uploadPeriod = jesAttributes.logFlushPeriod, contentType = Option(ContentTypes.`text/plain(UTF-8)`))
+          workingDisk, optional = false, secondary = false, uploadPeriod = jesAttributes.logFlushPeriod, contentType = plainTextContentType)
       }
 
       InputOutputParameters(
@@ -478,15 +524,31 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
 
     def uploadScriptFile = commandScriptContents.fold(
       errors => Future.failed(new RuntimeException(errors.toList.mkString(", "))),
-      asyncIo.writeAsync(jobPaths.script, _, Seq(CloudStorageOptions.withMimeType("text/plain"))))
+      asyncIo.writeAsync(jobPaths.script, _, Seq(CloudStorageOptions.withMimeType("text/plain")))
+    )
+
+    def sendGoogleLabelsToMetadata(customLabels: Seq[GoogleLabel]): Unit = {
+      lazy val backendLabelEvents: Map[String, String] = ((backendLabels ++ customLabels) map { l => s"${CallMetadataKeys.BackendLabels}:${l.key}" -> l.value }).toMap
+      tellMetadata(backendLabelEvents)
+    }
 
     val runPipelineResponse = for {
       _ <- evaluateRuntimeAttributes
       _ <- uploadScriptFile
+      customLabels <- Future.fromTry(GoogleLabels.fromWorkflowOptions(workflowDescriptor.workflowOptions))
       jesParameters <- generateInputOutputParameters
-      createParameters = createPipelineParameters(jesParameters)
+      createParameters = createPipelineParameters(jesParameters, customLabels)
+      localizationConfiguration = initializationData.papiConfiguration.papiAttributes.localizationConfiguration
+      gcsTransferLibraryCloudPath = jobPaths.callExecutionRoot / PipelinesApiJobPaths.GcsTransferLibraryName
+      transferLibraryContainerPath = createParameters.commandScriptContainerPath.sibling(GcsTransferLibraryName)
+      _ <- uploadGcsTransferLibrary(createParameters, gcsTransferLibraryCloudPath, localizationConfiguration)
+      gcsLocalizationScriptCloudPath = jobPaths.callExecutionRoot / PipelinesApiJobPaths.GcsLocalizationScriptName
+      _ <- uploadGcsLocalizationScript(createParameters, gcsLocalizationScriptCloudPath, transferLibraryContainerPath, localizationConfiguration)
+      gcsDelocalizationScriptCloudPath = jobPaths.callExecutionRoot / PipelinesApiJobPaths.GcsDelocalizationScriptName
+      _ <- uploadGcsDelocalizationScript(createParameters, gcsDelocalizationScriptCloudPath, transferLibraryContainerPath, localizationConfiguration)
       _ = this.hasDockerCredentials = createParameters.privateDockerKeyAndEncryptedToken.isDefined
       runId <- runPipeline(workflowId, createParameters, jobLogger)
+      _ = sendGoogleLabelsToMetadata(customLabels)
     } yield runId
 
     runPipelineResponse map { runId =>
@@ -563,6 +625,20 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
   override def handleExecutionFailure(runStatus: RunStatus,
                                       returnCode: Option[Int]): Future[ExecutionHandle] = {
 
+    def generateBetterErrorMsg(runStatus: RunStatus.UnsuccessfulRunStatus, errorMsg: String): String = {
+      if (runStatus.errorCode.getCode.value == PapiFailedPreConditionErrorCode
+          && errorMsg.contains("Execution failed")
+          && (errorMsg.contains("Localization") || errorMsg.contains("Delocalization"))) {
+        s"Please check the log file for more details: $jesLogPath."
+      }
+      //If error code 10, add some extra messaging to the server logging
+      else if (runStatus.errorCode.getCode.value == PapiMysteriouslyCrashedErrorCode) {
+        jobLogger.info(s"Job Failed with Error Code 10 for a machine where Preemptible is set to $preemptible")
+        errorMsg
+      }
+      else errorMsg
+    }
+
     // Inner function: Handles a 'Failed' runStatus (or Preempted if preemptible was false)
     def handleFailedRunStatus(runStatus: RunStatus.UnsuccessfulRunStatus,
                               returnCode: Option[Int]): Future[ExecutionHandle] = {
@@ -571,19 +647,21 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
       def isDockerPullFailure: Boolean = prettyError.contains("not found: does not exist or no pull access")
 
       (runStatus.errorCode, runStatus.jesCode) match {
-        case (Status.NOT_FOUND, Some(JesFailedToDelocalize)) => Future.successful(FailedNonRetryableExecutionHandle(FailedToDelocalizeFailure(runStatus.prettyPrintedError, jobTag, Option(standardPaths.error))))
-        case (Status.ABORTED, Some(JesUnexpectedTermination)) => handleUnexpectedTermination(runStatus.errorCode, runStatus.prettyPrintedError, returnCode)
+        case (Status.NOT_FOUND, Some(JesFailedToDelocalize)) => Future.successful(FailedNonRetryableExecutionHandle(FailedToDelocalizeFailure(prettyError, jobTag, Option(standardPaths.error))))
+        case (Status.ABORTED, Some(JesUnexpectedTermination)) => handleUnexpectedTermination(runStatus.errorCode, prettyError, returnCode)
         case _ if isDockerPullFailure =>
           val unable = s"Unable to pull Docker image '$jobDockerImage' "
           val details = if (hasDockerCredentials)
             "but Docker credentials are present; is this Docker account authorized to pull the image? " else
             "and there are effectively no Docker credentials present (one or more of token, authorization, or Google KMS key may be missing). " +
             "Please check your private Docker configuration and/or the pull access for this image. "
-          val message = unable + details + runStatus.prettyPrintedError
+          val message = unable + details + prettyError
           Future.successful(FailedNonRetryableExecutionHandle(StandardException(
             runStatus.errorCode, message, jobTag, returnCode, standardPaths.error), returnCode))
-        case _ => Future.successful(FailedNonRetryableExecutionHandle(StandardException(
-          runStatus.errorCode, runStatus.prettyPrintedError, jobTag, returnCode, standardPaths.error), returnCode))
+        case _ =>
+          val finalPrettyPrintedError = generateBetterErrorMsg(runStatus, prettyError)
+          Future.successful(FailedNonRetryableExecutionHandle(StandardException(
+            runStatus.errorCode, finalPrettyPrintedError, jobTag, returnCode, standardPaths.error), returnCode))
       }
     }
 
@@ -668,8 +746,8 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
           workingDisk.mountPoint.resolve(adHocFile.alternativeName.getOrElse(gcsPath.name)).pathAsString
         case (Success(path @ ( _: GcsPath | _: HttpPath)), _) =>
           workingDisk.mountPoint.resolve(path.pathWithoutScheme).pathAsString
-        case (Success(demoDosPath: DemoDosPath), _) =>
-          val filePath = demoDosResolver.getContainerRelativePath(demoDosPath)
+        case (Success(drsPath: DrsPath), _) =>
+          val filePath = DrsResolver.getContainerRelativePath(drsPath).unsafeRunSync()
           workingDisk.mountPoint.resolve(filePath).pathAsString
         case (Success(sraPath: SraPath), _) =>
           workingDisk.mountPoint.resolve(s"sra-${sraPath.accession}/${sraPath.pathWithoutScheme}").pathAsString
@@ -682,8 +760,8 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
     womFile.mapFile(value =>
       getPath(value) match {
         case Success(gcsPath: GcsPath) => workingDisk.mountPoint.resolve(gcsPath.pathWithoutScheme).pathAsString
-        case Success(demoDosPath: DemoDosPath) =>
-          val filePath = demoDosResolver.getContainerRelativePath(demoDosPath)
+        case Success(drsPath: DrsPath) =>
+          val filePath = DrsResolver.getContainerRelativePath(drsPath).unsafeRunSync()
           workingDisk.mountPoint.resolve(filePath).pathAsString
         case _ => value
       }

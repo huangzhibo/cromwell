@@ -32,27 +32,31 @@
 package cromwell.backend.impl.aws
 
 import java.net.SocketTimeoutException
-import java.util.concurrent.Executors
 
-import cats.data.Validated.Valid
-import cats.effect.{IO, Timer}
+import akka.actor.ActorRef
+import akka.pattern.AskSupport
+import akka.util.Timeout
 import common.collections.EnhancedCollections._
 import common.util.StringUtil._
 import common.validation.Validation._
 import cromwell.backend._
 import cromwell.backend.async.{ExecutionHandle, PendingExecutionHandle}
-import cromwell.backend.impl.aws.RunStatus.TerminalRunStatus
+import cromwell.backend.impl.aws.IntervalLimitedAwsJobSubmitActor.SubmitAwsJobRequest
+import cromwell.backend.impl.aws.OccasionalStatusPollingActor.{NotifyOfStatus, WhatsMyStatus}
+import cromwell.backend.impl.aws.RunStatus.{Initializing, TerminalRunStatus}
 import cromwell.backend.impl.aws.io._
 import cromwell.backend.io.DirectoryFunctions
 import cromwell.backend.standard.{StandardAsyncExecutionActor, StandardAsyncExecutionActorParams, StandardAsyncJob}
 import cromwell.core._
 import cromwell.core.path.{DefaultPathBuilder, Path}
+import cromwell.core.io.DefaultIoCommandBuilder
 import cromwell.core.retry.SimpleExponentialBackoff
 import cromwell.filesystems.s3.S3Path
 import cromwell.filesystems.s3.batch.S3BatchCommandBuilder
 import cromwell.services.keyvalue.KeyValueServiceActor._
 import cromwell.services.keyvalue.KvClient
 import org.slf4j.LoggerFactory
+import software.amazon.awssdk.services.batch.model.{BatchException, SubmitJobResponse}
 import wom.CommandSetupSideEffectFile
 import wom.callable.Callable.OutputDefinition
 import wom.core.FullyQualifiedName
@@ -60,9 +64,10 @@ import wom.expression.NoIoFunctionSet
 import wom.types.{WomArrayType, WomSingleFileType}
 import wom.values._
 
+import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration._
-import scala.concurrent.{ExecutionContext, Future}
 import scala.language.postfixOps
+import scala.util.control.NoStackTrace
 import scala.util.{Success, Try}
 
 object AwsBatchAsyncBackendJobExecutionActor {
@@ -73,9 +78,16 @@ object AwsBatchAsyncBackendJobExecutionActor {
 
 class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: StandardAsyncExecutionActorParams)
   extends BackendJobLifecycleActor with StandardAsyncExecutionActor with AwsBatchJobCachingActorHelper
-    with KvClient {
+    with KvClient with AskSupport {
 
-  override lazy val ioCommandBuilder = S3BatchCommandBuilder
+  override lazy val ioCommandBuilder = configuration.fileSystem match  {
+    case AWSBatchStorageSystems.s3 => S3BatchCommandBuilder
+    case _ =>  DefaultIoCommandBuilder
+  }
+
+  val backendSingletonActor: ActorRef =
+    standardParams.backendSingletonActorOption.getOrElse(
+      throw new RuntimeException(s"AWS Backend actor cannot exist without its backend singleton (of type ${AwsBatchSingletonActor.getClass.getSimpleName})"))
 
   import AwsBatchAsyncBackendJobExecutionActor._
 
@@ -95,6 +107,17 @@ class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: Standar
   private lazy val jobDockerImage = jobDescriptor.maybeCallCachingEligible.dockerHash.getOrElse(runtimeAttributes.dockerImage)
 
   override lazy val dockerImageUsed: Option[String] = Option(jobDockerImage)
+
+  private lazy val jobScriptMountPath =  configuration.fileSystem match  {
+    case AWSBatchStorageSystems.s3 =>  AwsBatchWorkingDisk.MountPoint.resolve(jobPaths.script.pathWithoutScheme.stripPrefix("/")).pathAsString
+    case _ =>  jobPaths.script.pathWithoutScheme
+  }
+
+
+  private lazy val execScript =
+    s"""|#!$jobShell
+        |$jobShell $jobScriptMountPath
+        |""".stripMargin
 
   /* Batch job object (see AwsBatchJob). This has the configuration necessary
    * to perform all operations with the AWS Batch infrastructure. This is
@@ -129,20 +152,17 @@ class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: Standar
    * commandScriptContents here
    */
   lazy val batchJob = {
-    val script = commandScriptContents match {
-      case Valid(s) => s
-      case errors => new RuntimeException(errors.toList.mkString(", "))
-    }
     AwsBatchJob(
       jobDescriptor,
       runtimeAttributes,
       instantiatedCommand.commandString,
-      script.toString,
+      execScript,
       rcPath.toString, executionStdout, executionStderr,
       generateAwsBatchInputs(jobDescriptor),
       generateAwsBatchOutputs(jobDescriptor),
       jobPaths, Seq.empty[AwsBatchParameter],
-      configuration.awsConfig.region)
+      configuration.awsConfig.region,
+      Option(configuration.awsAuth))
   }
   /* Tries to abort the job in flight
    *
@@ -182,7 +202,12 @@ class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: Standar
   private def relativeLocalizationPath(file: WomFile): WomFile = {
     file.mapFile(value =>
       getPath(value) match {
-        case Success(path) => path.pathWithoutScheme
+        case Success(path) => {
+          configuration.fileSystem match  {
+            case AWSBatchStorageSystems.s3 => path.pathWithoutScheme
+            case _ =>  path.toString
+          }
+        }
         case _ => value
       }
     )
@@ -217,8 +242,14 @@ class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: Standar
       case (name, files) => inputsFromWomFiles(name, files, files.map(relativeLocalizationPath), jobDescriptor)
     }
 
-    (writeFunctionInputs ++ callInputInputs).toSet
+    val scriptInput: AwsBatchInput = AwsBatchFileInput(
+      "script",
+      jobPaths.script.pathAsString,
+      DefaultPathBuilder.get(jobPaths.script.pathWithoutScheme),
+      workingDisk
+    )
 
+    Set(scriptInput) ++ writeFunctionInputs ++ callInputInputs
   }
 
   /**
@@ -228,8 +259,15 @@ class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: Standar
     * @throws Exception if the `path` does not live in one of the supplied `disks`
     */
   private def relativePathAndVolume(path: String, disks: Seq[AwsBatchVolume]): (Path, AwsBatchVolume) = {
+
+    def getAbsolutePath(path: Path) = {
+      configuration.fileSystem match {
+        case AWSBatchStorageSystems.s3 => AwsBatchWorkingDisk.MountPoint.resolve(path)
+        case _ => DefaultPathBuilder.get(configuration.root).resolve(path)
+      }
+  }
     val absolutePath = DefaultPathBuilder.get(path) match {
-      case p if !p.isAbsolute => AwsBatchWorkingDisk.MountPoint.resolve(p)
+      case p if !p.isAbsolute => getAbsolutePath(p)
       case p => p
     }
 
@@ -320,26 +358,43 @@ class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: Standar
     )
   }
 
-  override lazy val commandDirectory: Path = AwsBatchWorkingDisk.MountPoint
-
-  override def globParentDirectory(womGlobFile: WomGlobFile): Path = {
-    val (_, disk) = relativePathAndVolume(womGlobFile.value, runtimeAttributes.disks)
-    disk.mountPoint
+  override lazy val commandDirectory: Path = configuration.fileSystem match  {
+    case AWSBatchStorageSystems.s3 => AwsBatchWorkingDisk.MountPoint
+    case _ =>  jobPaths.callExecutionRoot
   }
 
-  override def isTerminal(runStatus: RunStatus): Boolean = {
+  override def globParentDirectory(womGlobFile: WomGlobFile): Path =
+    configuration.fileSystem match {
+      case  AWSBatchStorageSystems.s3 => {
+        val (_, disk) = relativePathAndVolume(womGlobFile.value, runtimeAttributes.disks)
+        disk.mountPoint
+      }
+      case _ => commandDirectory
+    }
+
+      override def isTerminal(runStatus: RunStatus): Boolean = {
     runStatus match {
       case _: TerminalRunStatus => true
       case _ => false
     }
   }
 
+  def uploadScriptFile(): Future[Unit] = {
+    commandScriptContents.fold(
+      errors => Future.failed(new RuntimeException(errors.toList.mkString(", "))),
+      asyncIo.writeAsync(jobPaths.script, _, Seq.empty)
+    )
+  }
+
   // Primary entry point for cromwell to actually run something
   override def executeAsync(): Future[ExecutionHandle] = {
-    implicit val timer: Timer[IO] = cats.effect.IO.timer(ExecutionContext.fromExecutor(Executors.newSingleThreadScheduledExecutor))
 
     for {
-      submitJobResponse <- batchJob.submitJob[IO]().run(attributes).unsafeToFuture()
+      _ <- uploadScriptFile()
+      completionPromise = Promise[SubmitJobResponse]
+      _ = backendSingletonActor ! SubmitAwsJobRequest(batchJob, attributes, completionPromise)
+      submitJobResponse <- completionPromise.future
+      _ = backendSingletonActor ! NotifyOfStatus(runtimeAttributes.queueArn, submitJobResponse.jobId, Option(Initializing))
     } yield PendingExecutionHandle(jobDescriptor, StandardAsyncJob(submitJobResponse.jobId), Option(batchJob), previousState = None)
   }
 
@@ -353,10 +408,37 @@ class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: Standar
   override def pollStatusAsync(handle: AwsBatchPendingExecutionHandle): Future[RunStatus] = {
     val jobId = handle.pendingJob.jobId
     val job = handle.runInfo match {
-      case Some(job) => job
-      case None => throw new RuntimeException(s"pollStatusAsync called but job not available. This should not happen. Jobid ${jobId}")
+      case Some(actualJob) => actualJob
+      case None =>
+        throw new RuntimeException(
+          s"pollStatusAsync called but job not available. This should not happen. Job Id $jobId"
+        )
     }
-    Future.fromTry(job.status(jobId))
+
+    implicit val timeout: Timeout = Timeout(5.seconds)
+
+    def useQuickAnswerOrFallback(quick: Any): Future[RunStatus] = quick match {
+      case NotifyOfStatus(_, _, Some(value)) =>
+        Future.successful(value)
+      case NotifyOfStatus(_, _, None) =>
+        jobLogger.info("Having to fall back to AWS query for status")
+        Future.fromTry(job.status(jobId))
+      case other =>
+        val message = s"Programmer Error (please report this): Received an unexpected message from the OccasionalPollingActor: $other"
+        jobLogger.error(message)
+        Future.failed(new Exception(message) with NoStackTrace)
+    }
+
+    for {
+      quickAnswer <- backendSingletonActor ? WhatsMyStatus(runtimeAttributes.queueArn, jobId)
+      guaranteedAnswer <- useQuickAnswerOrFallback(quickAnswer)
+    } yield guaranteedAnswer
+  }
+
+  // Despite being a "runtime" exception, BatchExceptions for 429 are *not* fatal:
+  override def isFatal(throwable: Throwable): Boolean = throwable match {
+    case be: BatchException => !be.getMessage.contains("Status Code: 429")
+    case _ => super.isFatal(throwable)
   }
 
   override lazy val startMetadataKeyValues: Map[String, Any] = super[AwsBatchJobCachingActorHelper].startMetadataKeyValues
@@ -399,7 +481,7 @@ class AwsBatchAsyncBackendJobExecutionActor(override val standardParams: Standar
   override def mapCommandLineWomFile(womFile: WomFile): WomFile = {
     womFile.mapFile(value =>
       getPath(value) match {
-        case Success(path: S3Path) => workingDisk.mountPoint.resolve(path.pathWithoutScheme.stripPrefix("/")).pathAsString
+        case Success(path: S3Path) => workingDisk.mountPoint.resolve(path.pathWithoutScheme).pathAsString
         case _ => value
       }
     )

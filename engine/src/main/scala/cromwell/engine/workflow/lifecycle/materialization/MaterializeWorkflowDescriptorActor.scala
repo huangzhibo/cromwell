@@ -2,44 +2,44 @@ package cromwell.engine.workflow.lifecycle.materialization
 
 import akka.actor.{ActorRef, FSM, LoggingFSM, Props, Status}
 import akka.pattern.pipe
-import cats.Monad
 import cats.data.EitherT._
-import cats.data.Validated.{Invalid, Valid}
 import cats.data.NonEmptyList
+import cats.data.Validated.{Invalid, Valid}
 import cats.effect.IO
+import cats.instances.list._
 import cats.syntax.apply._
 import cats.syntax.either._
+import cats.syntax.traverse._
 import cats.syntax.validated._
 import com.typesafe.config.Config
-import com.typesafe.scalalogging.LazyLogging
-import common.Checked
+import com.typesafe.scalalogging.StrictLogging
 import common.exception.{AggregatedMessageException, MessageAggregation}
-import common.transforms.CheckedAtoB
 import common.validation.Checked._
 import common.validation.ErrorOr._
-import common.validation.Parse._
+import common.validation.IOChecked._
 import cromwell.backend.BackendWorkflowDescriptor
 import cromwell.core.Dispatcher.EngineDispatcher
 import cromwell.core.WorkflowOptions.{ReadFromCache, WorkflowOption, WriteToCache}
-import cromwell.core._
 import cromwell.core.callcaching._
 import cromwell.core.io.AsyncIo
 import cromwell.core.labels.{Label, Labels}
 import cromwell.core.logging.WorkflowLogging
-import cromwell.core.path.PathBuilder
+import cromwell.core.path.{PathBuilder, PathBuilderFactory}
+import cromwell.core._
 import cromwell.engine._
 import cromwell.engine.backend.CromwellBackends
-import cromwell.engine.language.CromwellLanguages
+import cromwell.engine.workflow.WorkflowProcessingEventPublishing._
 import cromwell.engine.workflow.lifecycle.EngineLifecycleActorAbortCommand
 import cromwell.engine.workflow.lifecycle.materialization.MaterializeWorkflowDescriptorActor._
 import cromwell.filesystems.gcs.batch.GcsBatchCommandBuilder
 import cromwell.languages.util.ImportResolver._
+import cromwell.languages.util.LanguageFactoryUtil
 import cromwell.languages.{LanguageFactory, ValidatedWomNamespace}
 import cromwell.services.metadata.MetadataService._
 import cromwell.services.metadata.{MetadataEvent, MetadataKey, MetadataValue}
 import net.ceedubs.ficus.Ficus._
 import spray.json._
-import wom.core.{WorkflowSource, WorkflowUrl}
+import wom.core.WorkflowSource
 import wom.expression.{NoIoFunctionSet, WomExpression}
 import wom.graph.CommandCallNode
 import wom.graph.GraphNodePort.OutputPort
@@ -61,8 +61,8 @@ object MaterializeWorkflowDescriptorActor {
   private def cromwellBackends = CromwellBackends.instance.get
 
   def props(serviceRegistryActor: ActorRef, workflowId: WorkflowId, cromwellBackends: => CromwellBackends = cromwellBackends,
-            importLocalFilesystem: Boolean, ioActorProxy: ActorRef): Props = {
-    Props(new MaterializeWorkflowDescriptorActor(serviceRegistryActor, workflowId, cromwellBackends, importLocalFilesystem, ioActorProxy)).withDispatcher(EngineDispatcher)
+            importLocalFilesystem: Boolean, ioActorProxy: ActorRef, hogGroup: HogGroup): Props = {
+    Props(new MaterializeWorkflowDescriptorActor(serviceRegistryActor, workflowId, cromwellBackends, importLocalFilesystem, ioActorProxy, hogGroup)).withDispatcher(EngineDispatcher)
   }
 
   /*
@@ -105,9 +105,15 @@ object MaterializeWorkflowDescriptorActor {
       }
     }
 
-    val enabled = conf.as[Option[Boolean]]("call-caching.enabled").getOrElse(false)
-    val invalidateBadCacheResults = conf.as[Option[Boolean]]("call-caching.invalidate-bad-cache-results").getOrElse(true)
-    if (enabled) {
+    val callCachingConfig = conf.getConfig("call-caching")
+
+    def errorOrCallCachingBoolean(path: String): ErrorOr[Boolean] = {
+      import common.validation.Validation._
+      validate(callCachingConfig.getBoolean(path))
+    }
+
+    val errorOrEnabled = errorOrCallCachingBoolean("enabled")
+    if (errorOrEnabled.exists(_ == true)) {
       val readFromCache = readOptionalOption(ReadFromCache)
       val writeToCache = readOptionalOption(WriteToCache)
 
@@ -120,14 +126,28 @@ object MaterializeWorkflowDescriptorActor {
         }
       }
 
+      val errorOrMaybePrefixes = workflowOptions.getVectorOfStrings("call_cache_hit_path_prefixes")
+      val errorOrInvalidateBadCacheResults = errorOrCallCachingBoolean("invalidate-bad-cache-results")
+      val errorOrCallCachingOptions = (
+        errorOrMaybePrefixes,
+        errorOrInvalidateBadCacheResults,
+      ) mapN {
+        (
+          maybePrefixes,
+          invalidateBadCacheResults,
+        ) =>
+          CallCachingOptions(
+            invalidateBadCacheResults,
+            maybePrefixes,
+          )
+      }
       for {
-        maybePrefixes <- workflowOptions.getVectorOfStrings("call_cache_hit_path_prefixes")
-        callCachingOptions = CallCachingOptions(invalidateBadCacheResults, maybePrefixes)
+        callCachingOptions <- errorOrCallCachingOptions
         mode <- errorOrCallCachingMode(callCachingOptions)
       } yield mode
     }
     else {
-      CallCachingOff.validNel
+      errorOrEnabled.map(_ => CallCachingOff)
     }
   }
 }
@@ -137,7 +157,8 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
                                          workflowId: WorkflowId,
                                          cromwellBackends: => CromwellBackends,
                                          importLocalFilesystem: Boolean,
-                                         ioActorProxy: ActorRef) extends LoggingFSM[MaterializeWorkflowDescriptorActorState, Unit] with LazyLogging with WorkflowLogging {
+                                         ioActorProxy: ActorRef,
+                                         hogGroup: HogGroup) extends LoggingFSM[MaterializeWorkflowDescriptorActorState, Unit] with StrictLogging with WorkflowLogging {
 
   import MaterializeWorkflowDescriptorActor._
   val tag = self.path.name
@@ -148,6 +169,8 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
   val iOExecutionContext = context.system.dispatchers.lookup("akka.dispatchers.io-dispatcher")
   implicit val ec = context.dispatcher
 
+  protected val pathBuilderFactories: List[PathBuilderFactory] = EngineFilesystems.configuredPathBuilderFactories
+
   startWith(ReadyToMaterializeState, ())
 
   when(ReadyToMaterializeState) {
@@ -155,7 +178,7 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
       val replyTo = sender()
 
       workflowOptionsAndPathBuilders(workflowSourceFiles) match {
-        case Valid((workflowOptions, pathBuilders)) =>
+        case (workflowOptions, pathBuilders) =>
           val futureDescriptor: Future[ErrorOr[EngineWorkflowDescriptor]] = pathBuilders flatMap { pb =>
             val engineIoFunctions = new EngineIoFunctions(pb, new AsyncIo(ioActorProxy, GcsBatchCommandBuilder), iOExecutionContext)
             buildWorkflowDescriptor(workflowId, workflowSourceFiles, conf, workflowOptions, pb, engineIoFunctions).
@@ -169,9 +192,6 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
           // of replyTo in the data
           pipe(futureDescriptor).to(self, replyTo)
           goto(MaterializingState)
-        case Invalid(error) =>
-          workflowInitializationFailed(error, replyTo)
-          goto(MaterializationFailedState)
       }
     case Event(MaterializeWorkflowDescriptorAbortCommand, _) =>
       goto(MaterializationAbortedState)
@@ -218,12 +238,10 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
       })
   }
 
-  private def workflowOptionsAndPathBuilders(sourceFiles: WorkflowSourceFilesCollection): ErrorOr[(WorkflowOptions, Future[List[PathBuilder]])] = {
-    val workflowOptionsValidation = validateWorkflowOptions(sourceFiles.workflowOptionsJson)
-    workflowOptionsValidation map { workflowOptions =>
-      val pathBuilders = EngineFilesystems.pathBuildersForWorkflow(workflowOptions)(context.system)
-      (workflowOptions, pathBuilders)
-    }
+  private def workflowOptionsAndPathBuilders(sourceFiles: WorkflowSourceFilesCollection): (WorkflowOptions, Future[List[PathBuilder]]) = {
+    sourceFiles.workflowOptions
+    val pathBuilders = EngineFilesystems.pathBuildersForWorkflow(sourceFiles.workflowOptions, pathBuilderFactories)(context.system)
+    (sourceFiles.workflowOptions, pathBuilders)
   }
 
   private def buildWorkflowDescriptor(id: WorkflowId,
@@ -231,38 +249,11 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
                                       conf: Config,
                                       workflowOptions: WorkflowOptions,
                                       pathBuilders: List[PathBuilder],
-                                      engineIoFunctions: EngineIoFunctions): Parse[EngineWorkflowDescriptor] = {
-
-    def findWorkflowSource(workflowSource: Option[WorkflowSource],
-                           workflowUrl: Option[WorkflowUrl],
-                           resolvers: List[ImportResolver]): Checked[(WorkflowSource, List[ImportResolver])] = {
-      (workflowSource, workflowUrl) match {
-        case (Some(source), None) => (source, resolvers).validNelCheck
-        case (None, Some(url)) =>
-          val compoundImportResolver: CheckedAtoB[ImportResolutionRequest, ResolvedImportBundle] = CheckedAtoB.firstSuccess(resolvers.map(_.resolver), s"resolve workflowUrl '$url'")
-          val wfSourceAndResolvers: Checked[ResolvedImportBundle] = compoundImportResolver.run(ImportResolutionRequest(url, resolvers))
-          wfSourceAndResolvers map { v => (v.source, v.newResolvers) }
-        case (Some(_), Some(_)) => "Both workflow source and url can't be supplied".invalidNelCheck
-        case (None, None) => "Either workflow source or url has to be supplied".invalidNelCheck
-      }
-    }
+                                      engineIoFunctions: EngineIoFunctions): IOChecked[EngineWorkflowDescriptor] = {
 
     def findFactory(workflowSource: WorkflowSource): ErrorOr[LanguageFactory] = {
-      def chooseFactory(factories: List[LanguageFactory]): Option[LanguageFactory] = factories.find(_.looksParsable(workflowSource))
 
-      val factory: ErrorOr[LanguageFactory] = sourceFiles.workflowType match {
-        case Some(languageName) if CromwellLanguages.instance.languages.contains(languageName.toUpperCase) =>
-          val language = CromwellLanguages.instance.languages(languageName.toUpperCase)
-          sourceFiles.workflowTypeVersion match {
-            case Some(v) if language.allVersions.contains(v) => language.allVersions(v).valid
-            case Some(other) => s"Unknown version '$other' for workflow language '$languageName'".invalidNel
-            case _ => chooseFactory(language.allVersions.values.toList).getOrElse(language.default).valid
-          }
-        case Some(other) => s"Unknown workflow type: $other".invalidNel[LanguageFactory]
-        case None =>
-          val allFactories = CromwellLanguages.instance.languages.values.flatMap(_.allVersions.values)
-          chooseFactory(allFactories.toList).getOrElse(CromwellLanguages.instance.default.default).validNel
-      }
+      val factory = LanguageFactoryUtil.chooseFactory(workflowSource, sourceFiles)
 
       factory foreach { validFactory =>
         workflowLogger.info(s"Parsing workflow as ${validFactory.languageName} ${validFactory.languageVersionName}")
@@ -272,7 +263,7 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
       factory
     }
 
-    def buildValidatedNamespace(factory: LanguageFactory, workflowSource: WorkflowSource, importResolvers: List[ImportResolver]): Parse[ValidatedWomNamespace] = {
+    def buildValidatedNamespace(factory: LanguageFactory, workflowSource: WorkflowSource, importResolvers: List[ImportResolver]): IOChecked[ValidatedWomNamespace] = {
       factory.validateNamespace(
         sourceFiles,
         workflowSource,
@@ -288,25 +279,34 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
       if (importLocalFilesystem) DirectoryResolver.localFilesystemResolvers(None)
       else List.empty
 
-    val zippedResolverCheck: Parse[Option[ImportResolver]] = fromEither[IO](sourceFiles.importsZipFileOption match {
+    val zippedResolverCheck: IOChecked[Option[DirectoryResolver]] = fromEither[IO](sourceFiles.importsZipFileOption match {
       case None => None.validNelCheck
-      case Some(zipContent) => zippedImportResolver(zipContent).toEither.map(Option.apply)
+      case Some(zipContent) => zippedImportResolver(zipContent, workflowId).toEither.map(Option.apply)
     })
 
     val labels = convertJsonToLabels(sourceFiles.labelsJson)
 
     for {
-      _ <- publishLabelsToMetadata(id, labels)
+      _ <- publishLabelsToMetadata(id, labels.asMap, serviceRegistryActor)
       zippedImportResolver <- zippedResolverCheck
       importResolvers = zippedImportResolver.toList ++ localFilesystemResolvers :+ HttpResolver(None, Map.empty)
-      sourceAndResolvers <- fromEither[IO](findWorkflowSource(sourceFiles.workflowSource, sourceFiles.workflowUrl, importResolvers))
+      sourceAndResolvers <- fromEither[IO](LanguageFactoryUtil.findWorkflowSource(sourceFiles.workflowSource, sourceFiles.workflowUrl, importResolvers))
       _ = if(sourceFiles.workflowUrl.isDefined) publishWorkflowSourceToMetadata(id, sourceAndResolvers._1)
-      factory <- errorOrParse(findFactory(sourceAndResolvers._1))
-      outputRuntimeExtractor <- errorOrParse(factory.womOutputRuntimeExtractor.toValidated)
+      factory <- findFactory(sourceAndResolvers._1).toIOChecked
+      outputRuntimeExtractor <- factory.womOutputRuntimeExtractor.toValidated.toIOChecked
       validatedNamespace <- buildValidatedNamespace(factory, sourceAndResolvers._1, sourceAndResolvers._2)
+      closeResult = sourceAndResolvers._2.traverse(_.cleanupIfNecessary())
       _ = pushNamespaceMetadata(validatedNamespace)
-      ewd <- fromEither[IO](buildWorkflowDescriptor(id, validatedNamespace, workflowOptions, labels, conf, pathBuilders, outputRuntimeExtractor).toEither)
-    } yield ewd
+      ewd <- buildWorkflowDescriptor(id, validatedNamespace, workflowOptions, labels, conf, pathBuilders, outputRuntimeExtractor).toIOChecked
+    } yield {
+      closeResult match {
+        case Valid(_) => ()
+        case Invalid(errorsList) =>
+          logger.warn(s"Import resolver(s) closed with errors: [${errorsList.toList.mkString(", ")}]")
+      }
+
+      ewd
+    }
   }
 
   private def publishWorkflowSourceToMetadata(id: WorkflowId, workflowSource: WorkflowSource): Unit = {
@@ -374,18 +374,6 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
     }
   }
 
-  private def publishLabelsToMetadata(rootWorkflowId: WorkflowId, labels: Labels): Parse[Unit] = {
-    val defaultLabel = "cromwell-workflow-id" -> s"cromwell-$rootWorkflowId"
-    val customLabels = labels.asMap
-    Monad[Parse].pure(labelsToMetadata(customLabels + defaultLabel, rootWorkflowId))
-  }
-
-  protected def labelsToMetadata(labels: Map[String, String], workflowId: WorkflowId): Unit = {
-    labels foreach { case (k, v) =>
-      serviceRegistryActor ! PutMetadataAction(MetadataEvent(MetadataKey(workflowId, None, s"${WorkflowMetadataKeys.Labels}:$k"), MetadataValue(v)))
-    }
-  }
-
   private def buildWorkflowDescriptor(id: WorkflowId,
                                       womNamespace: ValidatedWomNamespace,
                                       workflowOptions: WorkflowOptions,
@@ -404,7 +392,7 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
     (failureModeValidation, backendAssignmentsValidation, callCachingModeValidation) mapN {
       case (failureMode, backendAssignments, callCachingMode) =>
         val callable = womNamespace.executable.entryPoint
-        val backendDescriptor = BackendWorkflowDescriptor(id, callable, womNamespace.womValueInputs, workflowOptions, labels, outputRuntimeExtractor)
+        val backendDescriptor = BackendWorkflowDescriptor(id, callable, womNamespace.womValueInputs, workflowOptions, labels, hogGroup, List.empty, outputRuntimeExtractor)
         EngineWorkflowDescriptor(callable, backendDescriptor, backendAssignments, failureMode, pathBuilders, callCachingMode)
     }
   }
@@ -452,13 +440,6 @@ class MaterializeWorkflowDescriptorActor(serviceRegistryActor: ActorRef,
         // TODO WOM: need access to a "source string" for WomExpressions
         // TODO WOM: ErrorOrify this ?
         throw AggregatedMessageException(s"Dynamic backends are not currently supported! Cannot assign backend '$backendNameAsExp' for Call: $callName", errors.toList)
-    }
-  }
-
-  private def validateWorkflowOptions(workflowOptions: String): ErrorOr[WorkflowOptions] = {
-    WorkflowOptions.fromJsonString(workflowOptions) match {
-      case Success(opts) => opts.validNel
-      case Failure(e) => s"Workflow contains invalid options JSON: ${e.getMessage}".invalidNel
     }
   }
 

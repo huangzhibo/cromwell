@@ -1,4 +1,58 @@
-## Getting started on Google Pipelines API
+## Getting started on Google Cloud with the Genomics Pipelines API
+
+## Pipelines API v2
+
+### Basic Information
+
+Initial support for Google [Pipelines API version 2](https://cloud.google.com/genomics/reference/rest/) was added in Cromwell 32.
+Expect feature parity with v1 except:
+
+* PAPI v2 private Docker support is equivalent to that in PAPI v1 but the configuration differs, please see [Docker configuration](http://cromwell.readthedocs.io/en/develop/filesystems/Google#Docker) for more details.
+* The "refresh token" authentication mode is **NOT** supported on PAPI V2.
+
+In addition, the following changes are to be expected:
+
+* Error messages for failed jobs might differ from V1
+* The Pipelines API log file content might differ from V1
+
+### Setting up PAPIv2
+
+For now the easiest way to try PAPIv2 is to migrate an existing set up from PAPIv1 (see below). After that, copy the PAPIv2 sample configuration in [cromwell.examples.conf](https://github.com/broadinstitute/cromwell/blob/develop/cromwell.example.backends/PAPIv2.conf) in place of the PAPIv1 backend.
+
+#### Permissions:
+
+Google recommends using a service account to authenticate to GCP.  
+
+You may create a service account using the `gcloud` command, consider running the following script and replace MY-GOOGLE-PROJECT:
+
+```
+#!/bin/bash
+RANDOM_BUCKET_NAME=$(head /dev/urandom | tr -dc a-z | head -c 32 ; echo '')
+
+#Create a new service account called "MyServiceAccount", and from the output of the command, take the email address that was generated
+EMAIL=$(gcloud beta iam service-accounts create MyServiceAccount --description "to run cromwell"  --display-name "cromwell service account" --format json | jq '.email' | sed -e 's/\"//g')
+
+# add all the roles to the service account
+for i in storage.objectCreator storage.objectViewer genomics.pipelinesRunner genomics.admin iam.serviceAccountUser storage.objects.create
+do
+    gcloud projects add-iam-policy-binding MY-GOOGLE-PROJECT --member serviceAccount:"$EMAIL" --role roles/$i
+done
+
+# create a bucket to keep the execution directory
+gsutil mb gs://"$RANDOM_BUCKET_NAME"
+
+# give the service account write access to the new bucket
+gsutil acl ch -u "$EMAIL":W gs://"$RANDOM_BUCKET_NAME"
+
+# create a file that represents your service account.  KEEP THIS A SECRET.
+gcloud iam service-accounts keys create sa.json --iam-account "$EMAIL"
+```
+
+## Pipelines API v1
+
+### Deprecation warning
+
+Please note that Google intends to deprecate PAPIv1 in the near future (circa mid 2019 or perhaps earlier). 
 
 ### Prerequisites
 

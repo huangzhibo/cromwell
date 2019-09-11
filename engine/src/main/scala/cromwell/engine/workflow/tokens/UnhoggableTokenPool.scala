@@ -5,7 +5,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 import cromwell.core.JobExecutionToken
 import cromwell.core.JobExecutionToken.JobExecutionTokenType
-import cromwell.engine.workflow.tokens.UnhoggableTokenPool.{ComeBackLater, Oink, TokenHoggingLease, UnhoggableTokenPoolResult}
+import cromwell.engine.workflow.tokens.UnhoggableTokenPool._
+import io.circe.generic.JsonCodec
 import io.github.andrebeat.pool._
 
 import scala.collection.immutable.HashSet
@@ -20,22 +21,30 @@ final class UnhoggableTokenPool(val tokenType: JobExecutionTokenType) extends Si
   _healthCheck = Function.const(true)) {
 
   lazy val hogLimitOption: Option[Int] = tokenType match {
-    case JobExecutionTokenType(_, None, _) => None
-    case JobExecutionTokenType(_, Some(limit), hogFactor) if hogFactor > 1 => Option(math.max(1, math.round(limit.floatValue() / hogFactor.floatValue())))
-    case JobExecutionTokenType(_, _, _) => None
+    case JobExecutionTokenType(_, Some(limit), hogFactor) if hogFactor > 1 =>
+      Option(math.max(1, math.round(limit.floatValue() / hogFactor.floatValue())))
+    case _ => None
   }
 
   private[this] val hogGroupAssignments: mutable.Map[String, HashSet[JobExecutionToken]] = mutable.Map.empty
 
   override def tryAcquire(): Option[Lease[JobExecutionToken]] = throw new UnsupportedOperationException("Use tryAcquire(hogGroup)")
 
-  def available(hogGroup: String): Boolean = {
+  def available(hogGroup: String): UnhoggableTokenPoolAvailability = {
+
     hogLimitOption match {
-      case None => leased < capacity
+      case None if leased < capacity => TokensAvailable
+      case None => TokenTypeExhausted
       case Some(hogLimit) =>
-        synchronized {
-          leased < capacity && hogGroupAssignments.get(hogGroup).forall(_.size < hogLimit)
-        }
+        if (leased < capacity) {
+          synchronized {
+            if (hogGroupAssignments.get(hogGroup).forall(_.size < hogLimit)) {
+              TokensAvailable
+            } else {
+              HogLimitExceeded
+            }
+          }
+        } else TokenTypeExhausted
     }
   }
 
@@ -46,16 +55,16 @@ final class UnhoggableTokenPool(val tokenType: JobExecutionTokenType) extends Si
         synchronized {
           val thisHogSet = hogGroupAssignments.getOrElse(hogGroup, HashSet.empty)
 
-          if (thisHogSet.size + 1 <= hogLimit) {
+          if (thisHogSet.size < hogLimit) {
             super.tryAcquire() match {
               case Some(lease) =>
                 val hoggingLease = new TokenHoggingLease(lease, hogGroup, this)
                 hogGroupAssignments += hogGroup -> (thisHogSet + hoggingLease.get)
                 hoggingLease
-              case None => ComeBackLater
+              case None => TokenTypeExhausted
             }
           } else {
-            Oink
+            if (leased == capacity) TokenTypeExhausted else HogLimitExceeded
           }
         }
       case None =>
@@ -63,7 +72,7 @@ final class UnhoggableTokenPool(val tokenType: JobExecutionTokenType) extends Si
           case Some(lease) =>
             val hoggingLease = new TokenHoggingLease(lease, hogGroup, this)
             hoggingLease
-          case None => ComeBackLater
+          case None => TokenTypeExhausted
         }
     }
   }
@@ -71,9 +80,30 @@ final class UnhoggableTokenPool(val tokenType: JobExecutionTokenType) extends Si
   def unhog(hogGroup: String, lease: Lease[JobExecutionToken]): Unit = {
     hogLimitOption foreach { _ =>
       synchronized {
-        hogGroupAssignments += hogGroup -> (hogGroupAssignments.getOrElse(hogGroup, HashSet.empty) - lease.get)
+        val newAssignment = hogGroupAssignments.getOrElse(hogGroup, HashSet.empty) - lease.get
+
+        if (newAssignment.isEmpty) {
+          hogGroupAssignments -= hogGroup
+        } else {
+          hogGroupAssignments += hogGroup -> newAssignment
+        }
       }
     }
+  }
+
+  def poolState: TokenPoolState = {
+    val (hogGroupUsages, hogLimitValue): (Option[Set[HogGroupState]], Option[Int]) = hogLimitOption match {
+      case Some(hogLimit) =>
+        synchronized {
+          val entries: Set[HogGroupState] = hogGroupAssignments.toSet[(String, HashSet[JobExecutionToken])].map { case (hogGroup, set) =>
+            HogGroupState(hogGroup, set.size, !hogGroupAssignments.get(hogGroup).forall(_.size < hogLimit))
+          }
+          (Option(entries), Option(hogLimit))
+        }
+      case None => (None, None)
+    }
+
+    TokenPoolState(hogGroupUsages, hogLimitValue, capacity, leased, leased < capacity)
   }
 }
 
@@ -81,7 +111,7 @@ object UnhoggableTokenPool {
   // 10 Million
   val MaxCapacity = 10 * 1000 * 1000
 
-  trait UnhoggableTokenPoolResult
+  sealed trait UnhoggableTokenPoolResult
 
   final class TokenHoggingLease(lease: Lease[JobExecutionToken], hogGroup: String, pool: UnhoggableTokenPool) extends Lease[JobExecutionToken] with UnhoggableTokenPoolResult {
     private[this] val dirty = new AtomicBoolean(false)
@@ -99,14 +129,30 @@ object UnhoggableTokenPool {
     }
   }
 
+  sealed trait UnhoggableTokenPoolAvailability { def available: Boolean }
+
+  case object TokensAvailable extends UnhoggableTokenPoolAvailability {
+    override def available: Boolean = true
+  }
+
   /**
     * You didn't get a lease because the pool is empty
     */
-  case object ComeBackLater extends UnhoggableTokenPoolResult
+  case object TokenTypeExhausted extends UnhoggableTokenPoolAvailability with UnhoggableTokenPoolResult {
+    override def available: Boolean = false
+  }
 
   /**
     * You didn't get a lease... because you're being a hog
     */
-  case object Oink extends UnhoggableTokenPoolResult
+  case object HogLimitExceeded extends UnhoggableTokenPoolAvailability with UnhoggableTokenPoolResult {
+    override def available: Boolean = false
+  }
+
+  @JsonCodec
+  final case class HogGroupState(hogGroup: String, used: Int, atLimit: Boolean)
+
+  @JsonCodec
+  final case class TokenPoolState(hogGroups: Option[Set[HogGroupState]], hogLimit: Option[Int], capacity: Int, leased: Int, available: Boolean)
 
 }

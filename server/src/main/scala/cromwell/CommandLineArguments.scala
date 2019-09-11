@@ -8,12 +8,14 @@ import cats.syntax.apply._
 import cats.syntax.either._
 import cats.syntax.validated._
 import common.validation.ErrorOr.ErrorOr
-import common.validation.Parse._
+import common.validation.IOChecked._
 import common.validation.Validation._
 import cromwell.CommandLineArguments._
 import cromwell.CromwellApp.Command
+import cromwell.core.WorkflowOptions
 import cromwell.core.path.{DefaultPathBuilder, Path}
 import cromwell.webservice.PartialWorkflowSources
+import cwl.preprocessor.CwlFileReference
 import cwl.preprocessor.CwlPreProcessor
 import org.slf4j.Logger
 
@@ -23,11 +25,11 @@ object CommandLineArguments {
   val DefaultCromwellHost = new URL("http://localhost:8000")
   case class ValidSubmission(workflowSource: Option[String],
                              workflowUrl: Option[String],
-                              workflowRoot: Option[String],
-                              worflowInputs: String,
-                              workflowOptions: String,
-                              workflowLabels: String,
-                              dependencies: Option[File])
+                             workflowRoot: Option[String],
+                             worflowInputs: String,
+                             workflowOptions: WorkflowOptions,
+                             workflowLabels: String,
+                             dependencies: Option[File])
 
   case class WorkflowSourceOrUrl(source: Option[String], url: Option[String])
 }
@@ -66,7 +68,7 @@ case class CommandLineArguments(command: Option[Command] = None,
       val workflowPath = File(workflowSourcePath.pathAsString)
 
       logger.info("Pre Processing Workflow...")
-      lazy val preProcessedCwl = cwlPreProcessor.preProcessCwlFileToString(workflowPath, workflowRoot)
+      lazy val preProcessedCwl = cwlPreProcessor.preProcessCwlToString(CwlFileReference(workflowPath, workflowRoot))
 
       Try(preProcessedCwl.value.unsafeRunSync())
         .toChecked
@@ -96,7 +98,9 @@ case class CommandLineArguments(command: Option[Command] = None,
       workflowInputs.map(preProcessCwlInputFile).getOrElse(readOptionContent("Workflow inputs", workflowInputs))
     } else readOptionContent("Workflow inputs", workflowInputs)
 
-    val optionsJson = readOptionContent("Workflow options", workflowOptions)
+    import common.validation.ErrorOr.ShortCircuitingFlatMap
+    val optionsJson = readOptionContent("Workflow options", workflowOptions).flatMap { WorkflowOptions.fromJsonString(_).toErrorOr }
+
     val labelsJson = readOptionContent("Workflow labels", workflowLabels)
 
     val workflowImports: Option[File] = imports.map(p => File(p.pathAsString))

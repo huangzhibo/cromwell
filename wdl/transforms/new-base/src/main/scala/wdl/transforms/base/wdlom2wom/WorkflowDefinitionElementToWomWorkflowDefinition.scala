@@ -4,23 +4,26 @@ import cats.syntax.validated._
 import common.validation.ErrorOr.{ErrorOr, _}
 import wdl.model.draft3.elements.ExpressionElement.{ArrayLiteral, IdentifierLookup, SelectFirst}
 import wdl.model.draft3.elements._
-import wdl.model.draft3.graph.{ExpressionValueConsumer, GeneratedValueHandle, LinkedGraph}
+import wdl.model.draft3.graph.{ExpressionValueConsumer, GeneratedCallFinishedHandle, GeneratedValueHandle, LinkedGraph}
 import wdl.shared.transforms.wdlom2wom.WomGraphMakerTools
 import wdl.transforms.base.linking.graph.LinkedGraphMaker
 import wdl.transforms.base.wdlom2wom.graph.{GraphNodeMakerInputs, WorkflowGraphElementToGraphNode}
 import wom.callable.{Callable, WorkflowDefinition}
 import wom.graph.expression.AnonymousExpressionNode
 import wom.graph.GraphNodePort.OutputPort
-import wom.graph.{GraphNode, WomIdentifier, Graph => WomGraph}
+import wom.graph.{CallNode, GraphNode, WomIdentifier, Graph => WomGraph}
 import wom.types.WomType
 import wdl.model.draft3.graph.ExpressionValueConsumer.ops._
 import wdl.model.draft3.graph.expression.{FileEvaluator, TypeEvaluator, ValueEvaluator}
 import wdl.transforms.base.wdlom2wom.graph.renaming.GraphIdentifierLookupRenamer.ops._
 import wdl.transforms.base.wdlom2wom.graph.renaming._
 
-object WorkflowDefinitionElementToWomWorkflowDefinition {
+object WorkflowDefinitionElementToWomWorkflowDefinition extends Util {
 
-  final case class WorkflowDefinitionConvertInputs(definitionElement: WorkflowDefinitionElement, typeAliases: Map[String, WomType], callables: Map[String, Callable])
+  final case class WorkflowDefinitionConvertInputs(definitionElement: WorkflowDefinitionElement,
+                                                   typeAliases: Map[String, WomType],
+                                                   callables: Map[String, Callable],
+                                                   convertNestedScatterToSubworkflow : Boolean)
 
   def convert(b: WorkflowDefinitionConvertInputs)
              (implicit expressionValueConsumer: ExpressionValueConsumer[ExpressionElement],
@@ -39,21 +42,31 @@ object WorkflowDefinitionElementToWomWorkflowDefinition {
         a.definitionElement.inputsSection.toSeq.flatMap(_.inputDeclarations) ++
         a.definitionElement.outputsSection.toSeq.flatMap(_.outputs)
 
-    val innerGraph: ErrorOr[WomGraph] = convertGraphElements(GraphLikeConvertInputs(graphNodeElements, Set.empty, a.typeAliases, a.definitionElement.name, insideAScatter = false, a.callables))
+    val innerGraph: ErrorOr[WomGraph] = convertGraphElements(GraphLikeConvertInputs(graphNodeElements, Set.empty, Map.empty, a.typeAliases, a.definitionElement.name,
+                                                                                    insideAScatter = false,
+                                                                                    convertNestedScatterToSubworkflow = b.convertNestedScatterToSubworkflow,
+                                                                                    a.callables))
     // NB: isEmpty means "not isDefined". We specifically do NOT add defaults if the output section is defined but empty.
     val withDefaultOutputs: ErrorOr[WomGraph] = if (a.definitionElement.outputsSection.isEmpty) {
       innerGraph map { WomGraphMakerTools.addDefaultOutputs(_, Some(WomIdentifier(a.definitionElement.name))) }
     } else {
       innerGraph
     }
-    (withDefaultOutputs map { ig =>  WorkflowDefinition(a.definitionElement.name, ig, Map.empty, Map.empty) }).contextualizeErrors(s"process workflow definition '${a.definitionElement.name}'")
+
+    val (meta, parameterMeta) = processMetaSections(a.definitionElement.metaSection, a.definitionElement.parameterMetaSection)
+
+    (withDefaultOutputs map {
+      ig => WorkflowDefinition(a.definitionElement.name, ig, meta, parameterMeta, b.definitionElement.sourceLocation)
+    }).contextualizeErrors(s"process workflow definition '${a.definitionElement.name}'")
   }
 
   final case class GraphLikeConvertInputs(graphElements: Set[WorkflowGraphElement],
                                           seedNodes: Set[GraphNode],
+                                          externalUpstreamCalls: Map[String, CallNode],
                                           typeAliases: Map[String, WomType],
                                           workflowName: String,
                                           insideAScatter: Boolean,
+                                          convertNestedScatterToSubworkflow: Boolean,
                                           callables: Map[String, Callable])
 
   def convertGraphElements(a: GraphLikeConvertInputs)
@@ -67,16 +80,20 @@ object WorkflowDefinitionElementToWomWorkflowDefinition {
       outputPort <- seedNode.outputPorts
     } yield GeneratedValueHandle(outputPort.name, outputPort.womType)
 
+    val finished = a.externalUpstreamCalls map { c => GeneratedCallFinishedHandle(c._2.localName) }
+
     for {
-      linkedGraph <- LinkedGraphMaker.make(nodes = a.graphElements, seedGeneratedValueHandles, typeAliases = a.typeAliases, callables = a.callables)
-      womGraph <- makeWomGraph(linkedGraph, a.seedNodes, a.workflowName, a.insideAScatter, a.callables)
+      linkedGraph <- LinkedGraphMaker.make(nodes = a.graphElements, seedGeneratedValueHandles ++ finished, typeAliases = a.typeAliases, callables = a.callables)
+      womGraph <- makeWomGraph(linkedGraph, a.seedNodes, a.externalUpstreamCalls, a.workflowName, a.insideAScatter, a.convertNestedScatterToSubworkflow, a.callables)
     } yield womGraph
   }
 
   private def makeWomGraph(linkedGraph: LinkedGraph,
                            seedNodes: Set[GraphNode],
+                           externalUpstreamCalls: Map[String, CallNode],
                            workflowName: String,
                            insideAScatter: Boolean,
+                           convertNestedScatterToSubworkflow : Boolean,
                            callables: Map[String, Callable])
                           (implicit expressionValueConsumer: ExpressionValueConsumer[ExpressionElement],
                            fileEvaluator: FileEvaluator[ExpressionElement],
@@ -93,9 +110,16 @@ object WorkflowDefinitionElementToWomWorkflowDefinition {
           port <- node.outputPorts
         } yield outputName(node, port) -> port).toMap
 
+        val internalUpstreamCalls: Map[String, CallNode] = (for {
+          node <- currentList
+          call <- node.containedCalls
+        } yield call.localName -> call).toMap
+
+        val upstreamCallNodes = externalUpstreamCalls ++ internalUpstreamCalls
+
         val generatedGraphNodesValidation: ErrorOr[Set[GraphNode]] =
           WorkflowGraphElementToGraphNode.convert(
-            GraphNodeMakerInputs(next, linkedGraph.consumedValueLookup, availableValues, linkedGraph.typeAliases, workflowName, insideAScatter, callables))
+            GraphNodeMakerInputs(next, upstreamCallNodes, linkedGraph.consumedValueLookup, availableValues, linkedGraph.typeAliases, workflowName, insideAScatter, convertNestedScatterToSubworkflow, callables))
         generatedGraphNodesValidation map { nextGraphNodes: Set[GraphNode] => currentList ++ nextGraphNodes }
       }
     }

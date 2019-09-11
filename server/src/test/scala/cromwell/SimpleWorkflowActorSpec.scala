@@ -1,5 +1,6 @@
 package cromwell
 
+import java.time.OffsetDateTime
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -8,13 +9,13 @@ import akka.testkit._
 import com.typesafe.config.ConfigFactory
 import cromwell.MetadataWatchActor.{FailureMatcher, Matcher}
 import cromwell.SimpleWorkflowActorSpec._
-import cromwell.core.{SimpleIoActor, WorkflowId, WorkflowSourceFilesWithoutImports}
+import cromwell.core._
 import cromwell.engine.backend.BackendSingletonCollection
 import cromwell.engine.workflow.WorkflowActor
 import cromwell.engine.workflow.WorkflowActor._
 import cromwell.engine.workflow.tokens.DynamicRateLimiter.Rate
 import cromwell.engine.workflow.tokens.JobExecutionTokenDispenserActor
-import cromwell.engine.workflow.workflowstore.{Submitted, WorkflowHeartbeatConfig}
+import cromwell.engine.workflow.workflowstore.{Submitted, WorkflowHeartbeatConfig, WorkflowToStart}
 import cromwell.util.SampleWdl
 import cromwell.util.SampleWdl.HelloWorld.Addressee
 import org.scalatest.BeforeAndAfter
@@ -45,7 +46,7 @@ class SimpleWorkflowActorSpec extends CromwellTestKitWordSpec with BeforeAndAfte
       workflowType = Option("WDL"),
       workflowTypeVersion = None,
       inputsJson = rawInputsOverride,
-      workflowOptionsJson = "{}",
+      workflowOptions = WorkflowOptions.empty,
       labelsJson = "{}",
       warnings = Vector.empty
     )
@@ -53,8 +54,9 @@ class SimpleWorkflowActorSpec extends CromwellTestKitWordSpec with BeforeAndAfte
     val watchActor = system.actorOf(MetadataWatchActor.props(promise, matchers: _*), s"service-registry-$workflowId-${UUID.randomUUID()}")
     val supervisor = TestProbe()
     val config = ConfigFactory.load()
+    val workflowToStart = WorkflowToStart(workflowId, OffsetDateTime.now(), workflowSources, Submitted, HogGroup("foo"))
     val workflowActor = TestFSMRef(
-      factory = new WorkflowActor(workflowId, Submitted, workflowSources, config,
+      factory = new WorkflowActor(workflowToStart, config,
         ioActor = system.actorOf(SimpleIoActor.props),
         serviceRegistryActor = watchActor,
         workflowLogCopyRouter = system.actorOf(Props.empty, s"workflow-copy-log-router-$workflowId-${UUID.randomUUID()}"),
@@ -63,7 +65,7 @@ class SimpleWorkflowActorSpec extends CromwellTestKitWordSpec with BeforeAndAfte
         callCacheReadActor = system.actorOf(EmptyCallCacheReadActor.props),
         callCacheWriteActor = system.actorOf(EmptyCallCacheWriteActor.props),
         dockerHashActor = system.actorOf(EmptyDockerHashActor.props),
-        jobTokenDispenserActor = system.actorOf(JobExecutionTokenDispenserActor.props(serviceRegistry, Rate(100, 1.second))),
+        jobTokenDispenserActor = system.actorOf(JobExecutionTokenDispenserActor.props(serviceRegistry, Rate(100, 1.second), None)),
         backendSingletonCollection = BackendSingletonCollection(Map("Local" -> None)),
         serverMode = true,
         workflowStoreActor = system.actorOf(Props.empty),

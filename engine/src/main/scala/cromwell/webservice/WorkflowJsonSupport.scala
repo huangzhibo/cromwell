@@ -3,17 +3,15 @@ package cromwell.webservice
 import java.nio.file.Paths
 import java.time.OffsetDateTime
 
+import better.files.File
+import common.util.TimeUtil._
 import cromwell.core._
 import cromwell.engine._
-import cromwell.services.metadata.MetadataService
-import MetadataService._
-import cromwell.util.JsonFormatting.WomValueJsonFormatter
-import WomValueJsonFormatter._
-import better.files.File
-import cromwell.services.healthmonitor.HealthMonitorServiceActor.{StatusCheckResponse, SubsystemStatus}
+import cromwell.services.healthmonitor.ProtoHealthMonitorServiceActor.{StatusCheckResponse, SubsystemStatus}
+import cromwell.services.metadata.MetadataService._
+import cromwell.util.JsonFormatting.WomValueJsonFormatter._
 import cromwell.webservice.routes.CromwellApiService.BackendResponse
-import cromwell.webservice.metadata.MetadataBuilderActor.BuiltMetadataResponse
-import spray.json.{DefaultJsonProtocol, JsString, JsValue, RootJsonFormat}
+import spray.json.{DefaultJsonProtocol, JsString, JsValue, JsonFormat, RootJsonFormat}
 
 object WorkflowJsonSupport extends DefaultJsonProtocol {
   implicit val workflowStatusResponseProtocol = jsonFormat2(WorkflowStatusResponse)
@@ -23,8 +21,16 @@ object WorkflowJsonSupport extends DefaultJsonProtocol {
   implicit val callOutputResponseProtocol = jsonFormat3(CallOutputResponse)
   implicit val engineStatsProtocol = jsonFormat2(EngineStatsActor.EngineStats)
   implicit val BackendResponseFormat = jsonFormat2(BackendResponse)
-  implicit val BuiltStatusResponseFormat = jsonFormat1(BuiltMetadataResponse)
   implicit val callAttempt = jsonFormat2(CallAttempt)
+
+  implicit val workflowOptionsFormatter: JsonFormat[WorkflowOptions] = new JsonFormat[WorkflowOptions]  {
+    override def read(json: JsValue): WorkflowOptions = json match {
+      case str: JsString => WorkflowOptions.fromJsonString(str.value).get
+      case other => throw new UnsupportedOperationException(s"Cannot use ${other.getClass.getSimpleName} value. Expected a workflow options String")
+    }
+    override def write(obj: WorkflowOptions): JsValue = JsString(obj.asPrettyJson)
+  }
+
   implicit val workflowSourceData = jsonFormat10(WorkflowSourceFilesWithoutImports)
   implicit val subsystemStatusFormat = jsonFormat2(SubsystemStatus)
   implicit val statusCheckResponseFormat = jsonFormat2(StatusCheckResponse)
@@ -33,7 +39,7 @@ object WorkflowJsonSupport extends DefaultJsonProtocol {
     override def write(obj: File) = JsString(obj.path.toAbsolutePath.toString)
     override def read(json: JsValue): File = json match {
       case JsString(str) => Paths.get(str)
-      case unknown => throw new NotImplementedError(s"Cannot parse $unknown to a File")
+      case unknown => throw new UnsupportedOperationException(s"Cannot parse $unknown to a File")
     }
   }
 
@@ -42,14 +48,14 @@ object WorkflowJsonSupport extends DefaultJsonProtocol {
   implicit val successResponse = jsonFormat3(SuccessResponse)
 
   implicit object DateJsonFormat extends RootJsonFormat[OffsetDateTime] {
-    override def write(obj: OffsetDateTime) = JsString(obj.toString)
+    override def write(offsetDateTime: OffsetDateTime) = JsString(offsetDateTime.toUtcMilliString)
 
     override def read(json: JsValue): OffsetDateTime = json match {
       case JsString(str) => OffsetDateTime.parse(str)
-      case unknown => throw new NotImplementedError(s"Cannot parse $unknown to a DateTime")
+      case unknown => throw new UnsupportedOperationException(s"Cannot parse $unknown to a DateTime")
     }
   }
 
-  implicit val workflowQueryResult = jsonFormat8(WorkflowQueryResult)
+  implicit val workflowQueryResult = jsonFormat9(WorkflowQueryResult)
   implicit val workflowQueryResponse = jsonFormat2(WorkflowQueryResponse)
 }

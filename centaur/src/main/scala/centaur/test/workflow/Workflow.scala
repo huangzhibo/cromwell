@@ -23,7 +23,8 @@ final case class Workflow private(testName: String,
                                   notInMetadata: List[String],
                                   directoryContentCounts: Option[DirectoryContentCountCheck],
                                   backends: BackendsRequirement,
-                                  retryTestFailures: Boolean) {
+                                  retryTestFailures: Boolean,
+                                  allowOtherOutputs: Boolean) {
   def toWorkflowSubmission(refreshToken: Option[String]) = WorkflowSingleSubmission(
     workflowSource = data.workflowContent,
     workflowUrl = data.workflowUrl,
@@ -47,7 +48,7 @@ final case class Workflow private(testName: String,
 object Workflow {
 
   def fromPath(path: Path): ErrorOr[Workflow] = {
-    Try(ConfigFactory.parseFile(path.toFile)) match {
+    Try(ConfigFactory.parseFile(path.toFile).resolve()) match {
       case Success(c) => Workflow.fromConfig(c, path.getParent)
       case Failure(_) => invalidNel(s"Invalid test config: $path")
     }
@@ -75,9 +76,13 @@ object Workflow {
           case Result.Failure(_) => invalidNel(s"No 'files' block in $configFile")
         }
         val retryTestFailuresErrorOr = validate(conf.get[Boolean]("retryTestFailures").valueOrElse(true))
+        val allowOtherOutputs: Boolean = conf.get[Boolean]("allowOtherOutputs") match {
+          case Result.Success(allow) => allow
+          case Result.Failure(_) => true
+        }
 
         (files, directoryContentCheckValidation, metadata, retryTestFailuresErrorOr) mapN {
-          (f, d, m, retryTestFailures) => Workflow(n, f, m, absentMetadata, d, backendsRequirement, retryTestFailures)
+          (f, d, m, retryTestFailures) => Workflow(n, f, m, absentMetadata, d, backendsRequirement, retryTestFailures, allowOtherOutputs)
         }
 
       case Result.Failure(_) => invalidNel(s"No name for: $configFile")

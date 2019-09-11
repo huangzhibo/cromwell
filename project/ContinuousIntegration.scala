@@ -1,3 +1,4 @@
+import Testing._
 import sbt.Keys._
 import sbt._
 import sbt.io.Path._
@@ -20,6 +21,7 @@ object ContinuousIntegration {
       IO.copyDirectory(srcCiResources.value, targetCiResources.value)
     },
     renderCiResources := {
+      minnieKenny.toTask("").value
       copyCiResources.value
       val log = streams.value.log
       if (!vaultToken.value.exists()) {
@@ -41,7 +43,7 @@ object ContinuousIntegration {
         "-e", "ENVIRONMENT=not_used",
         "-e", s"INPUT_PATH=${srcCiResources.value}",
         "-e", s"OUT_PATH=${targetCiResources.value}",
-        "broadinstitute/dsde-toolbox", "render-templates.sh"
+        "broadinstitute/dsde-toolbox:dev", "render-templates.sh"
       )
       val result = cmd ! log
       if (result != 0) {

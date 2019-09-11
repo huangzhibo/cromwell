@@ -125,7 +125,8 @@ abstract class CommandLineBindingCommandPart(commandLineBinding: CommandLineBind
       }
       case _: WomObjectLike => prefixAsList
       case WomEnumerationValue(_, value) => handlePrefix(value)
-      case w => throw new RuntimeException(s"Unhandled CwlExpressionCommandPart value '$w' of type ${w.womType.toDisplayString}")
+      case WomCoproductValue(_, value) => processValue(value)
+      case w => throw new RuntimeException(s"Unhandled CwlExpressionCommandPart value '$w' of type ${w.womType.stableName}")
     }
 
     evaluatedWomValue map { v => processValue(v) map applyShellQuote map (InstantiatedCommand(_)) } toValidated
